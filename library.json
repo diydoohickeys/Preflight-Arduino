@@ -1,0 +1,51 @@
+{
+  "name": "Preflight",
+  "version": "1.0.0",
+  "description": "Captive-portal WiFi setup, web logger with crash reports, OTA update page with rollback and an optional LVGL boot screen for ESP32 projects",
+  "keywords": [
+    "wifi",
+    "esp32",
+    "setup",
+    "captive-portal",
+    "provisioning",
+    "ota",
+    "logger",
+    "web-server",
+    "lvgl"
+  ],
+  "authors": [
+    {
+      "name": "James Cartwright"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/horse-pants/Preflight-Arduino.git"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/horse-pants/Preflight-Arduino",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": [
+    {
+      "owner": "esp32async",
+      "name": "ESPAsyncWebServer",
+      "version": "^3.11.0"
+    },
+    {
+      "owner": "esp32async",
+      "name": "AsyncTCP",
+      "version": "^3.4.9"
+    }
+  ],
+  "build": {
+    "flags": [
+      "-fexceptions"
+    ]
+  },
+  "export": {
+    "exclude": [
+      "extras"
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+name: Build examples
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  examples:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [BasicSetup, CustomCallbacks, WithDisplay, WideScreenDisplay]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ matrix.example }}-${{ hashFiles(format('examples/{0}/platformio.ini', matrix.example), 'library.json') }}
+
+      - run: pip install platformio
+
+      # Each example's platformio.ini consumes this checkout via symlink://../.. and builds
+      # both its esp32-s3 and esp32 environments.
+      - run: pio run -d examples/${{ matrix.example }}

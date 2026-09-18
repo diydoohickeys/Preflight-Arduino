@@ -1,0 +1,48 @@
+#######################################
+# Syntax Coloring Map For Preflight
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+WiFiSetupManager	KEYWORD1
+WiFiSetupConfig	KEYWORD1
+WiFiStatusCallback	KEYWORD1
+WiFiSetupBootUI	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+update	KEYWORD2
+getScannedNetworks	KEYWORD2
+isInSetupMode	KEYWORD2
+isConnected	KEYWORD2
+getIPAddress	KEYWORD2
+getHostName	KEYWORD2
+getSSID	KEYWORD2
+factoryReset	KEYWORD2
+initialize	KEYWORD2
+addText	KEYWORD2
+clearText	KEYWORD2
+isInitialized	KEYWORD2
+cleanup	KEYWORD2
+
+# Callback methods
+onScanStart	KEYWORD2
+onScanComplete	KEYWORD2
+onConnecting	KEYWORD2
+onConnectionProgress	KEYWORD2
+onConnected	KEYWORD2
+onAPMode	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+UI_COLOR_PRIMARY	LITERAL1
+UI_COLOR_BACKGROUND	LITERAL1
+UI_COLOR_SURFACE	LITERAL1
+UI_COLOR_SURFACE_LIGHT	LITERAL1
