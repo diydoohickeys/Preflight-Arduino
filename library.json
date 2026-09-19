@@ -1,6 +1,6 @@
 {
   "name": "Preflight",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "description": "Captive-portal WiFi setup, web logger with crash reports, OTA update page with rollback and an optional LVGL boot screen for ESP32 projects",
   "keywords": [
     "wifi",
