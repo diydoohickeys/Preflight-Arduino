@@ -1,6 +1,6 @@
 # Preflight-Arduino
 
-[![Build examples](https://github.com/horse-pants/Preflight-Arduino/actions/workflows/build.yml/badge.svg)](https://github.com/horse-pants/Preflight-Arduino/actions/workflows/build.yml)
+[![Build examples](https://github.com/diydoohickeys/Preflight-Arduino/actions/workflows/build.yml/badge.svg)](https://github.com/diydoohickeys/Preflight-Arduino/actions/workflows/build.yml)
 
 **Preflight** is everything an ESP32 project needs before the interesting part starts: a
 captive portal for WiFi credentials, a buffered logger with a web view and crash reports, an
@@ -30,7 +30,7 @@ OTA update page with rollback, and an optional LVGL boot screen. Built on ESPAsy
 
 | Setup | Logs | Update |
 |---|---|---|
-| ![The captive-portal setup page](docs/images/setup.png) | ![The log viewer](docs/images/logs.png) | ![The OTA update page](docs/images/update.png) |
+| ![The captive-portal setup page](https://raw.githubusercontent.com/diydoohickeys/Preflight-Arduino/main/docs/images/setup.png) | ![The log viewer](https://raw.githubusercontent.com/diydoohickeys/Preflight-Arduino/main/docs/images/logs.png) | ![The OTA update page](https://raw.githubusercontent.com/diydoohickeys/Preflight-Arduino/main/docs/images/update.png) |
 
 ## Requirements
 
@@ -57,7 +57,7 @@ alone is handled.
 
 ```ini
 lib_deps =
-    https://github.com/horse-pants/Preflight-Arduino.git#v1.0.0
+    https://github.com/diydoohickeys/Preflight-Arduino.git#v1.0.0
 ```
 
 The library's `library.json` pulls in ESPAsyncWebServer and AsyncTCP.
