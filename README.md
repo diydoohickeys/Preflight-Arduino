@@ -59,7 +59,7 @@ alone is handled.
 
 ```ini
 lib_deps =
-    https://github.com/diydoohickeys/Preflight-Arduino.git#v1.0.0
+    https://github.com/diydoohickeys/Preflight-Arduino.git#v1.1.0
 ```
 
 ### Arduino IDE
