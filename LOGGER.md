@@ -1,49 +1,48 @@
 # Logger
 
-A buffered logger for ESP32: writes to Serial, keeps recent entries in a PSRAM-backed ring
-buffer, serves them over HTTP, and optionally live-tails them over a WebSocket.
+A buffered logger: writes to the console (`ESP_LOG*` in the IDF build, `Serial` in the Arduino
+build), keeps recent entries in a PSRAM-backed ring buffer, and serves them over HTTP. The same
+source file serves both builds.
 
 ## Quick start
 
 ```cpp
 #include "Logger.h"
 
-void setup() {
-    Serial.begin(115200);
+Logger.begin(300);          // ring-buffer size
+Logger.setMinLevel(LOG_INFO);
+Logger.reportLastCrash();   // decode the previous boot's core dump, if any
 
-    Logger.begin(300);          // ring-buffer size
-    Logger.setMinLevel(LOG_INFO);
-    Logger.reportLastCrash();   // decode the previous boot's core dump, if any
+Logger.info("Application started");
+Logger.error("Failed to connect: %s", ssid.c_str());
 
-    Logger.info("Application started");
-    Logger.error("Failed to connect: %s", ssid.c_str());
-
-    Logger.registerEndpoints(&server);        // an AsyncWebServer*
-    // or, with live tail:
-    // Logger.registerEndpoints(&server, &webSocket);
-}
+Logger.registerEndpoints(server);   // an httpd_handle_t
 ```
-
-`WiFiSetupManager::enableLogger(n)` is a shortcut that calls `begin(n)` and
-`registerEndpoints()` against its own server.
 
 `begin(maxEntries, enableSerial, enableWebSocket)`:
 
 | Argument | |
 |---|---|
-| `maxEntries` | Entries to buffer. **0 disables buffering** — output still reaches Serial, the WebSocket and the output callback, and `/logs` serves an empty list. |
-| `enableSerial` | Mirror to Serial. Default true. |
-| `enableWebSocket` | Broadcast each entry to an attached `AsyncWebSocket`; the `/logs` page live-tails only while one is attached, and always at `/ws` — serve the socket there. Default true. |
+| `maxEntries` | Entries to buffer. **0 disables buffering** — output still reaches the console and the output callback, and `/logs` serves an empty list. |
+| `enableSerial` | Mirror to the console (`ESP_LOG*`, or `Serial` under Arduino). Default true. |
+| `enableWebSocket` | Whether the `/logs` page tries to live-tail (see below). Default true. |
 
 ## Levels
 
 `LOG_DEBUG` · `LOG_INFO` · `LOG_WARNING` · `LOG_ERROR`, filtered by `setMinLevel()`
-(default `LOG_INFO`). A filtered call returns before formatting, so a suppressed `debug()`
-costs one comparison rather than formatting a String and discarding it.
+(default `LOG_INFO`). A filtered call returns before formatting, so a suppressed
+`debug()` costs one comparison — it does not format a string and throw it away.
 
-Both a printf form and a `String` form exist for every level.
+A printf form and a `std::string` form exist for every level (plus `String` under Arduino):
+
+```cpp
+Logger.debug("value=%d", x);
+Logger.warning(std::string("something odd"));
+```
 
 ## Endpoints
+
+`registerEndpoints(httpd_handle_t)` adds:
 
 | Route | |
 |---|---|
@@ -56,8 +55,8 @@ large response that a RAM-tight server cannot serve; retention is unaffected. `?
 widens the window and `?max=0` returns everything — which is what you need to see the start
 of a boot, including anything `reportLastCrash()` printed.
 
-Responses are streamed in chunks rather than built whole, so peak allocation is one batch
-however many entries are requested.
+Responses are streamed in small chunks rather than built whole, so peak allocation is one
+batch however many entries are requested.
 
 ### Dropped entries
 
@@ -69,25 +68,20 @@ It is an entry rather than a field wrapping the response deliberately: `/api/log
 by external tooling that expects a bare array, and the notice has to be visible to whoever
 reads the log, including in a downloaded copy. `droppedCount()` returns the raw number.
 
-⚠ If you use `WiFiSetupManager` **without** calling `enableLogger()`, the manager's own log
-calls land here — `/logs` is empty and the dropped-entries notice says why.
-
 ### Live tail
 
+The `/logs` page can follow a WebSocket at `/ws` (`wss://` when the page is HTTPS). **This
+library does not register `/ws`** — a consumer provides it and forwards lines to it:
+
 ```cpp
-AsyncWebSocket ws("/ws");
-server.addHandler(&ws);
-Logger.begin(300, true, /*enableWebSocket=*/true);
-Logger.registerEndpoints(&server, &ws);
-// or later: Logger.attachWebSocket(&ws);
+Logger.setOutputCallback([](LogLevel level, uint32_t ts, const char* msg) {
+    const std::string line = Logger.liveTailJson(level, ts, msg);   // {"type":"log",…}
+    // copy it and send to every /ws client from the server task (httpd_queue_work)
+});
 ```
 
-Each entry is broadcast as `{"type":"log","timestamp":…,"level":…,"color":…,"message":…}`.
-The `/logs` page appends them live.
-
-`attachWebSocket()` and the WebSocket parameter of `registerEndpoints()` exist only in this
-Arduino library, as they take ESPAsyncWebServer types; the rest of the API matches the
-ESP-IDF sister exactly.
+In a build with no such endpoint, pass `enableWebSocket=false` so the page does not report a
+failed connect against a socket that does not exist.
 
 ## Reading entries in code
 
@@ -97,6 +91,26 @@ std::vector<LogEntry> recent = Logger.getEntries(50);   // newest 50; 0 = all
 
 A copy taken under the logger's lock, so it is safe while other tasks log. The copy
 allocates, so under memory pressure it throws `std::bad_alloc`.
+
+## Crash reporting
+
+```cpp
+Logger.reportLastCrash();   // once, early, after begin()
+```
+
+If the previous run ended in a panic and core-dump-to-flash is enabled, this decodes the
+stored dump and logs the faulting task, the program counter and (on Xtensa) a backtrace at
+ERROR level — through this Logger, so it reaches `/logs` and any output callback with no
+serial console attached. Resolve the addresses with `addr2line` against the firmware `.elf`.
+
+Requires `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`, a `coredump` partition, and the ELF format
+(`CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF`). A no-op otherwise, so it is safe to call
+unconditionally.
+
+A decoded dump is **erased** so it reports exactly once. A dump that could **not** be
+decoded is deliberately **kept**: erasing it would destroy the only copy of the evidence and
+guarantee the next panic is guesswork too, and a later build may decode it. The cost is one
+warning per boot until it is read.
 
 ## Forwarding elsewhere
 
@@ -111,34 +125,14 @@ non-blocking; anything slow here is paid by every log call. An exception it thro
 caught and discarded. A line it logs itself is buffered but not passed back to it, so it
 cannot recurse.
 
-## Crash reporting
-
-```cpp
-Logger.reportLastCrash();   // once, early, after begin()
-```
-
-If the previous run ended in a panic and core-dump-to-flash is enabled, this decodes the
-stored dump and logs the faulting task, the program counter and (on Xtensa) a backtrace at
-ERROR level — through this Logger, so it reaches `/logs` and the WebSocket with no serial
-console attached. Resolve the addresses with `addr2line` against the firmware `.elf`.
-
-Requires `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`, a `coredump` partition, and the ELF format.
-A no-op otherwise, so it is safe to call unconditionally.
-
-A decoded dump is **erased** so it reports exactly once. A dump that could **not** be
-decoded is deliberately **kept**: erasing it would destroy the only copy of the evidence and
-guarantee the next panic is guesswork too, and a later build may decode it.
-
-## Memory and exceptions
+## Memory
 
 Entries are allocated from PSRAM where available, falling back to internal heap, so the
-buffer does not compete with the network stack.
+buffer does not compete with the network stack for internal DRAM.
 
-🚨 **The allocator throws `std::bad_alloc` and the logger catches it, so this header
-requires `-fexceptions`** — and because `LogPSRAMAllocator` is a template, the throw is
-instantiated in *every* translation unit that includes `Logger.h`, not just the library's
-own. `library.json` sets the flag for the library, but PlatformIO library flags do not
-propagate to your sources: add `-fexceptions` to your own `build_flags`.
+⚠ **The allocator throws `std::bad_alloc` and the logger catches it** — see the
+Requirements section of the README. Under `-fno-exceptions` the component does not compile;
+with a zero emergency exception pool the catch never runs.
 
-Losing a line under memory pressure is intentional: the Serial output still happens, and
+Losing a line under memory pressure is intentional: the console output still happens, and
 the entry is counted and reported (see Dropped entries). The logger must never crash the device it is diagnosing.

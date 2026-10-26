@@ -23,9 +23,9 @@ void setup() {
 
     wifi.begin();
 
-    AsyncWebServer* server = wifi.getWebServer();
+    httpd_handle_t server = wifi.getWebServer();
     Logger.registerEndpoints(server);
-    ota.begin(server, "admin", "change-me", "");   // "" label = firmware only
+    ota.begin(server, "");   // "" label = firmware only
 
     if (wifi.isConnected()) {
         Logger.info("Connected to %s - http://%s/setup",

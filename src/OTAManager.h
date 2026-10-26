@@ -1,8 +1,15 @@
 #pragma once
 
-#include <Arduino.h>
-#include <ESPAsyncWebServer.h>
-#include <esp_partition.h>
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <string>
+#include <utility>
+#include <vector>
 #include <functional>
 
 class OTAManager {
@@ -29,11 +36,10 @@ public:
     OTAManager(const OTAManager&) = delete;
     OTAManager& operator=(const OTAManager&) = delete;
 
-    // Registers GET /update and POST /ota/upload; both require basic auth unless username or password is empty.
+    // Registers GET /update and POST /ota/upload, both behind the device password (AccessGuard).
     // partitionLabel "" refuses filesystem uploads (400). Use it whenever that partition holds user data:
-    // the upload is a raw overwrite with no confirmation and no undo. Filesystem uploads are also refused unless
-    // partitionLabel names the first spiffs-subtype data partition, the only one Update writes.
-    bool begin(AsyncWebServer* server, const char* username = "", const char* password = "", const char* partitionLabel = "spiffs");
+    // the upload is a raw overwrite with no confirmation and no undo.
+    bool begin(httpd_handle_t server, const char* partitionLabel = "spiffs");
 
     // Call regularly; performs the reboot after a successful update.
     void loop();
@@ -45,52 +51,62 @@ public:
     void setRefreshCallback(RefreshCallback callback);
     // Default true: reboot 2 s after a successful update.
     void setAutoReboot(bool enable);
+    // Firmware uploads go only to these app partitions (by label), never the running one: the first
+    // listed that isn't running. Empty (the default) = IDF's next OTA slot. Set it when the table has
+    // an app slot an upload must never overwrite (an extra image booted by handoff).
+    void setAppSlots(std::vector<std::string> labels);
+    // POST /ota/upload?slot=<label> writes an app image into that partition and does NOT boot it:
+    // for a second image the firmware boots itself by handoff. The image's project name must be
+    // `projectName`; anything else is rejected and the slot left unbootable. Unregistered labels
+    // are refused.
+    void addImageSlot(const char* label, const char* projectName);
 
-    Stage getCurrentStage() const { return currentStage_; }
-    uint8_t getCurrentProgress() const { return currentProgress_; }
-    bool isUpdating() const { return currentStage_ == Stage::IN_PROGRESS; }
-    bool isInitialized() const { return initialized_; }
+    Stage getCurrentStage() const { return _currentStage; }
+    uint8_t getCurrentProgress() const { return _currentProgress; }
+    bool isUpdating() const { return _currentStage == Stage::IN_PROGRESS; }
+    bool isInitialized() const { return _initialized; }
 
 private:
-    bool initialized_;
-    AsyncWebServer* server_;
-    AsyncCallbackWebHandler* pageHandler_;
-    AsyncCallbackWebHandler* uploadHandler_;
-    Stage currentStage_;
-    uint8_t currentProgress_;
-    size_t currentSize_;
-    size_t totalSize_;
-    bool autoReboot_;
-    bool rebootRequested_;
-    unsigned long rebootTime_;
-    String username_;
-    String password_;
-    String partitionLabel_;
+    bool _initialized;
+    httpd_handle_t _server;
+    Stage _currentStage;
+    uint8_t _currentProgress;
+    size_t _currentSize;
+    size_t _totalSize;
+    bool _autoReboot;
+    bool _rebootRequested;
+    uint32_t _rebootTime;
+    std::string _partitionLabel;
+    std::vector<std::string> _appSlots;
+    std::vector<std::pair<std::string, std::string>> _imageSlots;  // label -> project name
 
-    LEDProgressCallback ledProgressCallback_;
-    ScreenProgressCallback screenProgressCallback_;
-    StartCallback startCallback_;
-    EndCallback endCallback_;
-    RefreshCallback refreshCallback_;
+    esp_ota_handle_t _otaHandle;
+    const esp_partition_t* _updatePartition;
+    bool _otaInProgress;
 
-    // ESPAsyncWebServer can interleave two POSTs, so exactly one request owns the updater at a time.
-    // Only the owner fires the start and end callbacks, and its disconnect aborts the update.
-    AsyncWebServerRequest* uploadOwner_;
-    bool ownerWriting_;
+    LEDProgressCallback _ledProgressCallback;
+    ScreenProgressCallback _screenProgressCallback;
+    StartCallback _startCallback;
+    EndCallback _endCallback;
+    RefreshCallback _refreshCallback;
 
-    unsigned long lastProgressUpdate_;
-
-    // Content-Length may exceed the partition by at most this much: the multipart framing around the image.
-    static constexpr size_t MULTIPART_FRAMING_MAX = 1152;
+    bool _pageRouteRegistered;
+    bool _uploadRouteRegistered;
 
     void setupOTAEndpoints();
+    const esp_partition_t* firmwareTarget() const;
+    uint32_t getMillis() const { return (uint32_t)(esp_timer_get_time() / 1000); }
 
-    void admitUpload(AsyncWebServerRequest* request, const String& filename);
-    void writeUploadChunk(AsyncWebServerRequest* request, uint8_t* data, size_t len, bool final);
-    void completeUpload(AsyncWebServerRequest* request);
-    bool settleUpload(AsyncWebServerRequest* request);
-    void sendRefusal(AsyncWebServerRequest* request, int code, const char* reason);
+    static constexpr size_t UPLOAD_CHUNK = 4096;
+    // Holds a multipart delimiter (CRLF + "--" + <=70-char boundary) across a read split.
+    static constexpr size_t HOLD_MAX = 128;
+    // The boundary line + part headers must end within this many body bytes.
+    static constexpr size_t PART_HEADER_MAX = 1024;
+    // Content-Length may exceed the partition by at most this much: the multipart framing around the image.
+    static constexpr size_t MULTIPART_FRAMING_MAX = PART_HEADER_MAX + HOLD_MAX;
+    // Consecutive receive timeouts before a stalled upload is abandoned.
+    static constexpr int MAX_RECV_TIMEOUTS = 3;
 
-    const esp_partition_t* filesystemPartition() const;
-    bool authenticate(AsyncWebServerRequest* request) const;
+    static esp_err_t handleUpdatePage(httpd_req_t* req);
+    static esp_err_t handleOTAUpload(httpd_req_t* req);
 };

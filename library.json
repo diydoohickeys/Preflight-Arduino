@@ -26,18 +26,7 @@
   "homepage": "https://github.com/diydoohickeys/Preflight-Arduino",
   "frameworks": "arduino",
   "platforms": "espressif32",
-  "dependencies": [
-    {
-      "owner": "esp32async",
-      "name": "ESPAsyncWebServer",
-      "version": "^3.11.0"
-    },
-    {
-      "owner": "esp32async",
-      "name": "AsyncTCP",
-      "version": "^3.4.9"
-    }
-  ],
+  "dependencies": [],
   "build": {
     "flags": [
       "-fexceptions"
@@ -45,7 +34,8 @@
   },
   "export": {
     "exclude": [
-      "extras"
+      "extras",
+      ".github"
     ]
   }
 }

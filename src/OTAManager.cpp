@@ -1,461 +1,596 @@
 #include "OTAManager.h"
 #include "Logger.h"
 #include "SameOrigin.h"
-#include "html/ota_html.h"
-#include <Update.h>
-#include <esp_ota_ops.h>
-#include <esp_partition.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-namespace {
-
-// Held in request->_tempObject, which AsyncWebServerRequest releases with free(): keep it trivially destructible.
-struct UploadRequestState {
-    int code;  // 0 while the request is accepted
-    char reason[96];
-};
-
-UploadRequestState* requestState(AsyncWebServerRequest* request) {
-    return static_cast<UploadRequestState*>(request->_tempObject);
-}
-
-__attribute__((format(printf, 3, 4)))
-void refuse(UploadRequestState* state, int code, const char* format, ...) {
-    state->code = code;
-    va_list args;
-    va_start(args, format);
-    vsnprintf(state->reason, sizeof(state->reason), format, args);
-    va_end(args);
-}
-
-}  // namespace
+#include "HttpdRoute.h"
+#include "AccessGuard.h"
+#include "html/ota_html.h"  // generated from extras/html_source/ota.html by extras/convert_html.py
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 OTAManager::OTAManager()
-    : initialized_(false)
-    , server_(nullptr)
-    , pageHandler_(nullptr)
-    , uploadHandler_(nullptr)
-    , currentStage_(Stage::IDLE)
-    , currentProgress_(0)
-    , currentSize_(0)
-    , totalSize_(0)
-    , autoReboot_(true)
-    , rebootRequested_(false)
-    , rebootTime_(0)
-    , ledProgressCallback_(nullptr)
-    , screenProgressCallback_(nullptr)
-    , startCallback_(nullptr)
-    , endCallback_(nullptr)
-    , refreshCallback_(nullptr)
-    , uploadOwner_(nullptr)
-    , ownerWriting_(false)
-    , lastProgressUpdate_(0)
+    : _initialized(false)
+    , _server(nullptr)
+    , _currentStage(Stage::IDLE)
+    , _currentProgress(0)
+    , _currentSize(0)
+    , _totalSize(0)
+    , _autoReboot(true)
+    , _rebootRequested(false)
+    , _rebootTime(0)
+    , _otaHandle(0)
+    , _updatePartition(nullptr)
+    , _otaInProgress(false)
+    , _ledProgressCallback(nullptr)
+    , _screenProgressCallback(nullptr)
+    , _startCallback(nullptr)
+    , _endCallback(nullptr)
+    , _refreshCallback(nullptr)
+    , _pageRouteRegistered(false)
+    , _uploadRouteRegistered(false)
 {
 }
 
-// Each route captures `this`, so the routes go with it; the server must not have been destroyed yet.
+// Each route's user_ctx is `this`, so the routes go with it; the server must not have been stopped yet.
 OTAManager::~OTAManager() {
-    if (uploadOwner_) {
-        AsyncWebServerRequest* owner = uploadOwner_;
-        uploadOwner_ = nullptr;
-        ownerWriting_ = false;
-        owner->onDisconnect(nullptr);
-        Update.abort();
-        // Its handler is deleted below, so the connection is dropped before another chunk can reach it.
-        owner->abort();
+    if (_pageRouteRegistered) {
+        httpd_unregister_uri_handler(_server, "/update", HTTP_GET);
     }
-    if (server_) {
-        server_->removeHandler(pageHandler_);
-        server_->removeHandler(uploadHandler_);
+    if (_uploadRouteRegistered) {
+        httpd_unregister_uri_handler(_server, "/ota/upload", HTTP_POST);
     }
 }
 
-bool OTAManager::begin(AsyncWebServer* server, const char* username, const char* password, const char* partitionLabel) {
-    if (initialized_) {
+bool OTAManager::begin(httpd_handle_t server, const char* partitionLabel) {
+    if (_initialized) {
         return true;
     }
 
     if (!server) {
-        Logger.error("OTAManager: No web server provided!");
+        Logger.error("OTA: no web server provided!");
         return false;
     }
 
-    server_ = server;
-    username_ = username ? username : "";
-    password_ = password ? password : "";
-    partitionLabel_ = partitionLabel ? partitionLabel : "spiffs";
+    _server = server;
+    _partitionLabel = partitionLabel ? partitionLabel : "spiffs";
 
     setupOTAEndpoints();
 
-    Logger.info("OTA Manager initialized successfully");
-    if (partitionLabel_.isEmpty()) {
-        Logger.info("Filesystem updates: DISABLED");
-    } else if (!filesystemPartition()) {
-        Logger.warning("Filesystem updates: DISABLED - '%s' is not the first spiffs partition, the only one Update writes",
-                       partitionLabel_.c_str());
-    } else {
-        Logger.info("Filesystem partition label: %s", partitionLabel_.c_str());
-    }
-    initialized_ = true;
+    Logger.info("OTA Manager initialized (filesystem updates: %s)",
+                _partitionLabel.empty() ? "DISABLED"
+                                        : ("partition '" + _partitionLabel + "'").c_str());
+    _initialized = true;
     return true;
 }
 
 void OTAManager::loop() {
-    if (!initialized_) {
+    if (!_initialized) {
         return;
     }
 
-    if (rebootRequested_ && autoReboot_ && (millis() - rebootTime_ > 2000)) {
-        Logger.info("Rebooting...");
-        ESP.restart();
+    if (_rebootRequested && _autoReboot && (getMillis() - _rebootTime > 2000)) {
+        Logger.info("OTA: rebooting...");
+        esp_restart();
     }
 }
 
 void OTAManager::setLEDProgressCallback(LEDProgressCallback callback) {
-    ledProgressCallback_ = callback;
+    _ledProgressCallback = callback;
 }
 
 void OTAManager::setScreenProgressCallback(ScreenProgressCallback callback) {
-    screenProgressCallback_ = callback;
+    _screenProgressCallback = callback;
 }
 
 void OTAManager::setStartCallback(StartCallback callback) {
-    startCallback_ = callback;
+    _startCallback = callback;
 }
 
 void OTAManager::setEndCallback(EndCallback callback) {
-    endCallback_ = callback;
+    _endCallback = callback;
 }
 
 void OTAManager::setRefreshCallback(RefreshCallback callback) {
-    refreshCallback_ = callback;
+    _refreshCallback = callback;
 }
 
 void OTAManager::setAutoReboot(bool enable) {
-    autoReboot_ = enable;
+    _autoReboot = enable;
+}
+
+void OTAManager::setAppSlots(std::vector<std::string> labels) {
+    _appSlots = std::move(labels);
+}
+
+void OTAManager::addImageSlot(const char* label, const char* projectName) {
+    _imageSlots.emplace_back(label ? label : "", projectName ? projectName : "");
+}
+
+const esp_partition_t* OTAManager::firmwareTarget() const {
+    if (_appSlots.empty()) {
+        return esp_ota_get_next_update_partition(nullptr);
+    }
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    for (const std::string& label : _appSlots) {
+        const esp_partition_t* part =
+            esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, label.c_str());
+        if (part && (!running || part->address != running->address)) {
+            return part;
+        }
+    }
+    return nullptr;
 }
 
 void OTAManager::setupOTAEndpoints() {
-    // The page hides its Filesystem card unless OTA_FS_ENABLED is injected at the marker (inline, so no
-    // reveal flash and no extra route); a missing marker leaves it hidden, the safe default.
-    pageHandler_ = &server_->on("/update", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        if (!authenticate(request)) {
-            sendRefusal(request, 401, "Unauthorized");
-            return;
-        }
+    httpd_uri_t update_page = wifisetup::route("/update", HTTP_GET, handleUpdatePage, this);
+    _pageRouteRegistered = httpd_register_uri_handler(_server, &update_page) == ESP_OK;
 
-        static const char kMarker[] = "<!--OTA_CAPS-->";
-        const char* marker = strstr(OTA_HTML, kMarker);
-        if (!marker) {
-            request->send(200, "text/html", OTA_HTML);
-            return;
-        }
+    httpd_uri_t ota_upload = wifisetup::route("/ota/upload", HTTP_POST, handleOTAUpload, this);
+    _uploadRouteRegistered = httpd_register_uri_handler(_server, &ota_upload) == ESP_OK;
 
-        const char* caps = filesystemPartition()
-                               ? "<script>window.OTA_FS_ENABLED=true;</script>"
-                               : "<script>window.OTA_FS_ENABLED=false;</script>";
-
-        String html;
-        html.reserve(strlen(OTA_HTML) + 48);
-        html.concat(OTA_HTML, marker - OTA_HTML);
-        html.concat(caps);
-        html.concat(marker + (sizeof(kMarker) - 1));
-        request->send(200, "text/html", html);
-    });
-
-    // ESPAsyncWebServer keeps streaming the body after a chunk refuses it and only then runs the
-    // completion handler, so a refusal is carried to it per request and sent from there, once.
-    uploadHandler_ = &server_->on("/ota/upload", HTTP_POST,
-        [this](AsyncWebServerRequest *request) {
-            completeUpload(request);
-        },
-        [this](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-            // Every gate, auth included, must be here: the body is written before the completion
-            // handler runs, so auth checked only there still lets an unauthenticated image boot.
-            if (index == 0 && !request->_tempObject) {
-                admitUpload(request, filename);
-            }
-
-            // A refused request, and any request but the owner, drains without reaching the updater.
-            if (request != uploadOwner_ || !ownerWriting_) {
-                return;
-            }
-
-            writeUploadChunk(request, data, len, final);
-        }
-    );
+    if (_pageRouteRegistered && _uploadRouteRegistered) {
+        Logger.info("OTA: endpoints registered (/update, /ota/upload)");
+    } else {
+        Logger.error("OTA: could not register %s%s (handler table full or route already taken)",
+                     _pageRouteRegistered ? "" : "/update ",
+                     _uploadRouteRegistered ? "" : "/ota/upload");
+    }
 }
 
-void OTAManager::admitUpload(AsyncWebServerRequest* request, const String& filename) {
-    auto* state = static_cast<UploadRequestState*>(calloc(1, sizeof(UploadRequestState)));
-    if (!state) {
-        Logger.error("OTA: upload rejected - out of memory");
-        return;
+static const char* findInBuffer(const char* haystack, size_t haystackLen, const char* needle, size_t needleLen) {
+    if (needleLen == 0 || needleLen > haystackLen) return nullptr;
+    const char* last = haystack + (haystackLen - needleLen);
+    for (const char* p = haystack; p <= last; p++) {
+        p = static_cast<const char*>(memchr(p, needle[0], (size_t)(last - p) + 1));
+        if (!p) break;
+        if (memcmp(p, needle, needleLen) == 0) {
+            return p;
+        }
     }
-    request->_tempObject = state;
+    return nullptr;
+}
 
-    if (!authenticate(request)) {
-        Logger.warning("OTA: upload rejected - authentication required");
-        refuse(state, 401, "Unauthorized");
-        return;
+// Writes "--" + the Content-Type boundary into `out`, or leaves it empty when absent or unusable.
+// Returns whether the body is multipart at all.
+static bool parseBoundary(httpd_req_t* req, char* out, size_t outLen) {
+    out[0] = '\0';
+
+    char contentType[128] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", contentType, sizeof(contentType)) != ESP_OK) {
+        return false;
+    }
+    const char* start = strstr(contentType, "boundary=");
+    if (!start) {
+        return false;
+    }
+    start += 9;  // strlen("boundary=")
+
+    size_t len;
+    if (*start == '"') {
+        start++;
+        const char* end = strchr(start, '"');
+        if (!end) {
+            return true;
+        }
+        len = (size_t)(end - start);
+    } else {
+        len = strcspn(start, " \r\n;");
+    }
+
+    if (len > 0 && len + 3 <= outLen) {
+        out[0] = '-';
+        out[1] = '-';
+        memcpy(out + 2, start, len);
+        out[len + 2] = '\0';
+    }
+    return true;
+}
+
+// The page hides its Filesystem card unless OTA_FS_ENABLED is injected at the marker (inline, so no
+// reveal flash and no extra route); a missing marker leaves it hidden, the safe default.
+esp_err_t OTAManager::handleUpdatePage(httpd_req_t* req) {
+    auto* self = static_cast<OTAManager*>(req->user_ctx);
+
+    if (!Access.allow(req)) {
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "text/html");
+
+    static const char kMarker[] = "<!--OTA_CAPS-->";
+    const size_t htmlLen = strlen(OTA_HTML);
+    const char* marker = findInBuffer(OTA_HTML, htmlLen, kMarker, sizeof(kMarker) - 1);
+    if (!marker) {
+        httpd_resp_send(req, OTA_HTML, htmlLen);
+        return ESP_OK;
+    }
+
+    const bool fsEnabled = self && !self->_partitionLabel.empty();
+    const char* caps = fsEnabled ? "<script>window.OTA_FS_ENABLED=true;</script>"
+                                 : "<script>window.OTA_FS_ENABLED=false;</script>";
+
+    httpd_resp_send_chunk(req, OTA_HTML, marker - OTA_HTML);
+    httpd_resp_send_chunk(req, caps, HTTPD_RESP_USE_STRLEN);
+    const char* tail = marker + (sizeof(kMarker) - 1);
+    httpd_resp_send_chunk(req, tail, htmlLen - (tail - OTA_HTML));
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
+// Every refusal before the body is read returns ESP_FAIL, so httpd closes the socket instead of draining it.
+esp_err_t OTAManager::handleOTAUpload(httpd_req_t* req) {
+    auto* self = static_cast<OTAManager*>(req->user_ctx);
+
+    // Before any body byte is read, so an unauthenticated request never reaches esp_ota_write().
+    if (!Access.allow(req)) {
+        Logger.warning("OTA: upload rejected - sign in required");
+        return ESP_FAIL;
     }
 
     // A no-cors cross-site POST needs no preflight, so without credentials any page could flash the device.
-    if (!wifisetup::isSameOrigin(request)) {
+    if (!wifisetup::isSameOrigin(req)) {
         Logger.warning("OTA: upload rejected - cross-origin request");
-        refuse(state, 403, "Cross-origin request refused");
-        return;
+        wifisetup::sendCrossOriginRefused(req);
+        return ESP_FAIL;
     }
 
-    // Overlapping POSTs would interleave their writes into one partition.
-    if (uploadOwner_) {
+    // Overlapping POSTs would share _otaHandle and interleave their writes into one partition.
+    if (self->_currentStage == Stage::STARTING || self->_currentStage == Stage::IN_PROGRESS) {
         Logger.warning("OTA: upload rejected - an update is already running");
-        refuse(state, 409, "An update is already in progress");
-        return;
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_send(req, "An update is already in progress", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
     }
 
     // A staged image is the boot target: a second upload would erase it, and a restart
     // mid-write boots the previous firmware instead.
-    if (currentStage_ == Stage::COMPLETE) {
+    if (self->_currentStage == Stage::COMPLETE) {
         Logger.warning("OTA: upload rejected - an update is waiting for a restart");
-        refuse(state, 409, "An update is already installed and waiting for a restart");
-        return;
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_send(req, "An update is already installed and waiting for a restart", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
     }
 
-    String type = "firmware";
-    if (request->hasParam("type", true)) {
-        type = request->getParam("type", true)->value();
-    } else if (request->hasParam("type")) {
-        type = request->getParam("type")->value();
+    const size_t totalSize = req->content_len;
+    if (totalSize == 0) {
+        Logger.error("OTA: upload rejected - no content");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content");
+        return ESP_FAIL;
     }
-    const bool isFilesystem = type == "filesystem";
 
-    if (isFilesystem && partitionLabel_.isEmpty()) {
+    char query[64] = {0};
+    bool isFilesystem = false;
+    char slotLabel[17] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char param[16];
+        if (httpd_query_key_value(query, "type", param, sizeof(param)) == ESP_OK) {
+            isFilesystem = (strcmp(param, "filesystem") == 0);
+        }
+        if (httpd_query_key_value(query, "slot", slotLabel, sizeof(slotLabel)) != ESP_OK) {
+            slotLabel[0] = '\0';
+        }
+    }
+    const std::string* imageProject = nullptr;
+    if (slotLabel[0] && !isFilesystem) {
+        for (const auto& slot : self->_imageSlots) {
+            if (slot.first == slotLabel) {
+                imageProject = &slot.second;
+                break;
+            }
+        }
+        if (!imageProject) {
+            Logger.warning("OTA: upload refused - '%s' is not an image slot", slotLabel);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unknown image slot");
+            return ESP_FAIL;
+        }
+    }
+
+    if (isFilesystem && self->_partitionLabel.empty()) {
         Logger.warning("OTA: filesystem update refused - disabled on this device");
-        refuse(state, 400, "Filesystem updates are disabled on this device");
-        return;
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Filesystem updates are disabled on this device");
+        return ESP_FAIL;
     }
 
-    const esp_partition_t* target = isFilesystem ? filesystemPartition() : esp_ota_get_next_update_partition(nullptr);
-    if (!target && isFilesystem) {
-        Logger.warning("OTA: filesystem update refused - '%s' is not the first spiffs partition, the only one Update writes",
-                       partitionLabel_.c_str());
-        refuse(state, 400, "Filesystem update refused: '%s' is not the partition the updater writes",
-               partitionLabel_.c_str());
-        return;
+    char boundary[80];
+    const bool isMultipart = parseBoundary(req, boundary, sizeof(boundary));
+    if (isMultipart && boundary[0] == '\0') {
+        Logger.warning("OTA: upload rejected - unusable multipart boundary");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Malformed multipart boundary");
+        return ESP_FAIL;
     }
+
+    // Any data subtype: the table may declare the label as littlefs rather than spiffs.
+    const esp_partition_t* target = isFilesystem
+        ? esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, self->_partitionLabel.c_str())
+        : imageProject
+            ? esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, slotLabel)
+            : self->firmwareTarget();
     if (!target) {
-        Logger.error("OTA: upload rejected - No OTA partition");
-        refuse(state, 500, "No OTA partition");
-        return;
+        const char* msg = isFilesystem ? "Filesystem partition not found" : "No OTA partition";
+        Logger.error("OTA: upload rejected - %s", msg);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, msg);
+        return ESP_FAIL;
     }
+
+    Logger.info("OTA: target partition '%s' = %u bytes (%u KB); incoming content-length = %u bytes",
+                target->label, (unsigned)target->size, (unsigned)(target->size / 1024), (unsigned)totalSize);
 
     // Before anything is written: an overflow found mid-write would leave the old filesystem destroyed.
     // The body wraps the image in multipart framing; the exact limit is enforced on the bytes written.
-    const size_t bodySize = request->contentLength();
-    if (bodySize > target->size + MULTIPART_FRAMING_MAX) {
+    if (totalSize > target->size + MULTIPART_FRAMING_MAX) {
         Logger.warning("OTA: upload rejected - %u-byte body exceeds the '%s' partition (%u bytes)",
-                       (unsigned)bodySize, target->label, (unsigned)target->size);
-        refuse(state, 413, "Image is larger than the '%s' partition (%u bytes)",
-               target->label, (unsigned)target->size);
-        return;
+                       (unsigned)totalSize, target->label, (unsigned)target->size);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Image is larger than the '%s' partition (%u bytes)",
+                 target->label, (unsigned)target->size);
+        httpd_resp_send_err(req, HTTPD_413_CONTENT_TOO_LARGE, msg);
+        return ESP_FAIL;
     }
 
-    uploadOwner_ = request;
-    request->onDisconnect([this, request]() {
-        if (uploadOwner_ == request) {
-            Logger.warning("OTA: client disconnected mid-upload at %u bytes", (unsigned)currentSize_);
-            settleUpload(request);
+    Logger.info("OTA: upload starting - type=%s, content-length=%u bytes, multipart=%s",
+                isFilesystem ? "filesystem" : "firmware", (unsigned)totalSize,
+                isMultipart ? "yes" : "no");
+
+    self->_currentSize = 0;
+    self->_currentProgress = 0;
+    self->_totalSize = totalSize;
+    self->_updatePartition = target;
+    self->_otaInProgress = false;
+    self->_currentStage = Stage::STARTING;
+
+    if (self->_screenProgressCallback) {
+        self->_screenProgressCallback(0, Stage::STARTING);
+    }
+    if (self->_ledProgressCallback) {
+        self->_ledProgressCallback(0);
+    }
+    if (self->_startCallback) {
+        self->_startCallback();
+    }
+
+    // The start callback has fired, so every exit from here must fire the end callback.
+    bool success = true;
+    httpd_err_code_t failCode = HTTPD_500_INTERNAL_SERVER_ERROR;
+    char failMsg[160] = {0};
+
+    size_t received = 0;
+    size_t written = 0;
+    bool targetOpen = false;
+
+    // Nothing destructive happens before the first image byte, so a malformed or abandoned body leaves the target intact.
+    auto writeOut = [&](const char* p, size_t n) -> bool {
+        if (n == 0) return true;
+        if (written + n > target->size) {
+            failCode = HTTPD_413_CONTENT_TOO_LARGE;
+            snprintf(failMsg, sizeof(failMsg), "Image is larger than the '%s' partition (%u bytes)",
+                     target->label, (unsigned)target->size);
+            return false;
         }
-    });
+        if (!targetOpen) {
+            esp_err_t err;
+            if (isFilesystem) {
+                Logger.info("OTA: erasing partition '%s' (%u bytes)...", target->label, (unsigned)target->size);
+                err = esp_partition_erase_range(target, 0, target->size);
+            } else {
+                err = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &self->_otaHandle);
+                self->_otaInProgress = (err == ESP_OK);
+            }
+            if (err != ESP_OK) {
+                snprintf(failMsg, sizeof(failMsg), "%s failed: %s",
+                         isFilesystem ? "Partition erase" : "OTA begin", esp_err_to_name(err));
+                return false;
+            }
+            targetOpen = true;
+            self->_currentStage = Stage::IN_PROGRESS;
+        }
+        esp_err_t werr = isFilesystem
+            ? esp_partition_write(target, written, p, n)
+            : esp_ota_write(self->_otaHandle, p, n);
+        if (werr != ESP_OK) {
+            Logger.error("OTA: %s write failed at offset %u: %s",
+                         isFilesystem ? "filesystem" : "firmware",
+                         (unsigned)written, esp_err_to_name(werr));
+            snprintf(failMsg, sizeof(failMsg), "Flash write failed: %s", esp_err_to_name(werr));
+            return false;
+        }
+        written += n;
+        return true;
+    };
 
-    if (isFilesystem) {
-        Logger.info("Starting filesystem OTA update (partition: %s)", partitionLabel_.c_str());
-    } else {
-        Logger.info("Starting firmware OTA update");
-    }
-    currentSize_ = 0;
-    currentProgress_ = 0;
-    // The whole multipart body, slightly larger than the image; the percentage is clamped.
-    totalSize_ = bodySize;
-
-    currentStage_ = Stage::STARTING;
-    if (screenProgressCallback_) {
-        screenProgressCallback_(0, Stage::STARTING);
-    }
-    if (ledProgressCallback_) {
-        ledProgressCallback_(0);
-    }
-    if (startCallback_) {
-        startCallback_();
+    // Receives into `in`; up to HOLD_MAX held-back bytes sit just before it, so a delimiter split across
+    // two reads is still found in one contiguous window.
+    char* buffer = (char*)malloc(HOLD_MAX + UPLOAD_CHUNK);
+    char* const in = buffer ? buffer + HOLD_MAX : nullptr;
+    if (!buffer) {
+        snprintf(failMsg, sizeof(failMsg), "Memory allocation failed");
+        success = false;
     }
 
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN, isFilesystem ? U_SPIFFS : U_FLASH, -1, 0,
-                      isFilesystem ? partitionLabel_.c_str() : nullptr)) {
-        Logger.error("Update.begin failed: %s", Update.errorString());
-        refuse(state, 500, "Update.begin failed: %s", Update.errorString());
-        return;
-    }
+    // The image ends at the first delimiter; anything after it is drained unwritten.
+    char delimiter[84] = {0};
+    const size_t delimLen = isMultipart ? (size_t)snprintf(delimiter, sizeof(delimiter), "\r\n%s", boundary) : 0;
 
-    ownerWriting_ = true;
-    currentStage_ = Stage::IN_PROGRESS;
-    Logger.info("OTA update session opened (file: %s, body: %u bytes)",
-                filename.c_str(), (unsigned)totalSize_);
-    lastProgressUpdate_ = 0;
-}
+    size_t headerLen = 0;
+    size_t holdLen = 0;
+    bool headersDone = !isMultipart;
+    bool imageEnded = false;
+    int timeouts = 0;
+    uint32_t lastProgressUpdate = 0;
 
-void OTAManager::writeUploadChunk(AsyncWebServerRequest* request, uint8_t* data, size_t len, bool final) {
-    if (len) {
-        if (Update.write(data, len) != len) {
-            Logger.error("Update.write failed: %s", Update.errorString());
-            refuse(requestState(request), 500, "Update.write failed: %s", Update.errorString());
-            // Frees Update's ~4 KB buffer and half-written state now, not at the next begin().
-            Update.abort();
-            ownerWriting_ = false;
-            return;
+    while (success && received < totalSize) {
+        char* dest = headersDone ? in : in + headerLen;
+        const int ret = httpd_req_recv(req, dest, headersDone ? UPLOAD_CHUNK : UPLOAD_CHUNK - headerLen);
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < MAX_RECV_TIMEOUTS) {
+            continue;
+        }
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                Logger.error("OTA: client stalled at %u/%u bytes", (unsigned)received, (unsigned)totalSize);
+                failCode = HTTPD_408_REQ_TIMEOUT;
+                snprintf(failMsg, sizeof(failMsg), "Upload stalled");
+            } else {
+                Logger.error("OTA: receive error %d at %u/%u bytes", ret, (unsigned)received, (unsigned)totalSize);
+                snprintf(failMsg, sizeof(failMsg), "Upload interrupted (network error %d)", ret);
+            }
+            success = false;
+            break;
+        }
+        timeouts = 0;
+
+        received += (size_t)ret;
+        self->_currentSize = received;
+
+        char* data = dest;
+        size_t dataLen = (size_t)ret;
+
+        // The boundary line and part headers can span reads, so they are gathered before the image begins.
+        if (!headersDone) {
+            headerLen += (size_t)ret;
+            const size_t searchable = headerLen < PART_HEADER_MAX ? headerLen : PART_HEADER_MAX;
+            const char* headerEnd = findInBuffer(in, searchable, "\r\n\r\n", 4);
+            if (!headerEnd) {
+                if (headerLen < PART_HEADER_MAX && received < totalSize) {
+                    continue;
+                }
+                failCode = HTTPD_400_BAD_REQUEST;
+                snprintf(failMsg, sizeof(failMsg), "Malformed multipart body - part headers not found");
+                success = false;
+                break;
+            }
+            const size_t boundaryLen = delimLen - 2;
+            if ((size_t)(headerEnd - in) < boundaryLen || memcmp(in, boundary, boundaryLen) != 0) {
+                failCode = HTTPD_400_BAD_REQUEST;
+                snprintf(failMsg, sizeof(failMsg), "Malformed multipart body - opening boundary not found");
+                success = false;
+                break;
+            }
+            headersDone = true;
+            data = const_cast<char*>(headerEnd) + 4;
+            dataLen = headerLen - (size_t)(data - in);
+            Logger.debug("OTA: multipart headers parsed, image starts at body offset %u", (unsigned)(data - in));
         }
 
-        currentSize_ += len;
+        if (!imageEnded) {
+            char* window = data - holdLen;
+            const size_t windowLen = holdLen + dataLen;
+            const char* delim = delimLen ? findInBuffer(window, windowLen, delimiter, delimLen) : nullptr;
+            size_t emit;
+            if (delim) {
+                emit = (size_t)(delim - window);
+                imageEnded = true;
+            } else {
+                emit = windowLen - (delimLen < windowLen ? delimLen : windowLen);
+            }
+            if (!writeOut(window, emit)) {
+                success = false;
+                break;
+            }
+            holdLen = imageEnded ? 0 : windowLen - emit;
+            memmove(in - holdLen, window + emit, holdLen);
+        }
 
-        if (totalSize_ > 0) {
-            size_t pct = (currentSize_ * 100) / totalSize_;
-            currentProgress_ = pct > 100 ? 100 : (uint8_t)pct;
+        self->_currentProgress = (received * 100) / totalSize;
 
-            if (millis() - lastProgressUpdate_ > 100) {
-                Logger.debug("OTA Progress: %u%%", currentProgress_);
+        uint32_t now = self->getMillis();
+        if (now - lastProgressUpdate > 100) {
+            Logger.debug("OTA: progress %d%%", self->_currentProgress);
 
-                if (screenProgressCallback_) {
-                    screenProgressCallback_(currentProgress_, Stage::IN_PROGRESS);
-                }
-                if (ledProgressCallback_) {
-                    ledProgressCallback_(currentProgress_);
-                }
+            if (self->_screenProgressCallback) {
+                self->_screenProgressCallback(self->_currentProgress, Stage::IN_PROGRESS);
+            }
+            if (self->_ledProgressCallback) {
+                self->_ledProgressCallback(self->_currentProgress);
+            }
+            lastProgressUpdate = now;
+        }
 
-                lastProgressUpdate_ = millis();
+        if (self->_refreshCallback) {
+            self->_refreshCallback();
+        }
+
+        vTaskDelay(1);
+    }
+
+    free(buffer);
+
+    if (success && isMultipart && !imageEnded) {
+        failCode = HTTPD_400_BAD_REQUEST;
+        snprintf(failMsg, sizeof(failMsg), "Upload incomplete - closing boundary not found");
+        success = false;
+    } else if (success && written == 0) {
+        failCode = HTTPD_400_BAD_REQUEST;
+        snprintf(failMsg, sizeof(failMsg), "No image data received");
+        success = false;
+    }
+
+    Logger.info("OTA: transfer done - %u bytes received, %u bytes written to '%s'",
+                (unsigned)received, (unsigned)written, target->label);
+
+    if (success && !isFilesystem) {
+        esp_err_t err = esp_ota_end(self->_otaHandle);
+        if (err != ESP_OK) {
+            Logger.error("OTA: esp_ota_end failed: %s (image invalid, truncated, or corrupt)", esp_err_to_name(err));
+            snprintf(failMsg, sizeof(failMsg), "Firmware image rejected: %s", esp_err_to_name(err));
+            success = false;
+        } else if (imageProject) {
+            esp_app_desc_t desc;
+            if (esp_ota_get_partition_description(target, &desc) != ESP_OK ||
+                strncmp(desc.project_name, imageProject->c_str(), sizeof(desc.project_name)) != 0) {
+                Logger.error("OTA: '%s' takes a %s image - rejected", target->label, imageProject->c_str());
+                snprintf(failMsg, sizeof(failMsg), "Not a %s image", imageProject->c_str());
+                esp_partition_erase_range(target, 0, target->erase_size);
+                success = false;
+            }
+        } else {
+            err = esp_ota_set_boot_partition(target);
+            if (err != ESP_OK) {
+                Logger.error("OTA: esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+                snprintf(failMsg, sizeof(failMsg), "Could not set boot partition: %s", esp_err_to_name(err));
+                success = false;
             }
         }
-
-        if (refreshCallback_) {
-            refreshCallback_();
-        }
-
-        yield();
+    } else if (!success && self->_otaInProgress) {
+        esp_ota_abort(self->_otaHandle);
     }
 
-    if (final) {
-        ownerWriting_ = false;
-        Logger.info("OTA transfer done - %u bytes written", (unsigned)currentSize_);
-        if (currentSize_ == 0) {
-            Update.abort();
-            refuse(requestState(request), 400, "No image data received");
-        } else if (Update.end(true)) {
-            Logger.info("OTA update finished successfully");
-        } else {
-            Logger.error("Update.end failed: %s", Update.errorString());
-            refuse(requestState(request), 500, "Update.end failed: %s", Update.errorString());
-            Update.abort();
-        }
-    }
-}
+    self->_otaInProgress = false;
 
-void OTAManager::completeUpload(AsyncWebServerRequest* request) {
-    if (request == uploadOwner_) {
-        if (settleUpload(request)) {
-            request->send(200, "text/plain", "Update successful");
-        } else {
-            const UploadRequestState* state = requestState(request);
-            sendRefusal(request, state->code, state->reason);
-        }
-        return;
-    }
-
-    const UploadRequestState* state = requestState(request);
-    if (state) {
-        sendRefusal(request, state->code, state->reason);
-        return;
-    }
-
-    // No file part reached the upload handler, so its gates never ran.
-    if (!authenticate(request)) {
-        sendRefusal(request, 401, "Unauthorized");
-    } else if (!wifisetup::isSameOrigin(request)) {
-        sendRefusal(request, 403, "Cross-origin request refused");
-    } else {
-        sendRefusal(request, 400, "No file in the upload");
-    }
-}
-
-// Releases the updater and fires the end callback; runs once per owned upload, from its completion or its disconnect.
-bool OTAManager::settleUpload(AsyncWebServerRequest* request) {
-    UploadRequestState* state = requestState(request);
-    if (ownerWriting_) {
-        Update.abort();
-        ownerWriting_ = false;
-        refuse(state, 400, "Upload incomplete");
-    }
-
-    const bool success = state->code == 0;
-    uploadOwner_ = nullptr;
-
-    if (endCallback_) {
-        endCallback_(success);
+    if (self->_endCallback) {
+        self->_endCallback(success);
     }
 
     if (success) {
-        currentStage_ = Stage::COMPLETE;
-        currentProgress_ = 100;
+        self->_currentStage = Stage::COMPLETE;
+        self->_currentProgress = 100;
 
-        if (screenProgressCallback_) {
-            screenProgressCallback_(100, Stage::COMPLETE);
+        if (self->_screenProgressCallback) {
+            self->_screenProgressCallback(100, Stage::COMPLETE);
         }
-        if (ledProgressCallback_) {
-            ledProgressCallback_(100);
+        if (self->_ledProgressCallback) {
+            self->_ledProgressCallback(100);
         }
 
-        if (autoReboot_) {
-            rebootRequested_ = true;
-            rebootTime_ = millis();
+        httpd_resp_sendstr(req, "Update successful");
+
+        if (self->_autoReboot) {
+            Logger.info("OTA: update successful - rebooting shortly");
+            self->_rebootRequested = true;
+            self->_rebootTime = self->getMillis();
+        } else {
+            Logger.info("OTA: update successful - installed on the next restart");
         }
     } else {
-        currentStage_ = Stage::FAILED;
+        self->_currentStage = Stage::FAILED;
 
-        if (screenProgressCallback_) {
-            screenProgressCallback_(currentProgress_, Stage::FAILED);
+        if (self->_screenProgressCallback) {
+            self->_screenProgressCallback(self->_currentProgress, Stage::FAILED);
         }
 
-        Logger.error("OTA: update failed - %s", state->reason);
+        const char* msg = failMsg[0] ? failMsg : "Update failed";
+        Logger.error("OTA: update FAILED - %s", msg);
+        httpd_resp_send_err(req, failCode, msg);
     }
-    return success;
-}
 
-void OTAManager::sendRefusal(AsyncWebServerRequest* request, int code, const char* reason) {
-    if (code == 401) {
-        request->requestAuthentication(AsyncAuthType::AUTH_BASIC, "OTA");
-    } else if (code == 403) {
-        wifisetup::sendCrossOriginRefused(request);
-    } else {
-        request->send(code ? code : 500, "text/plain", reason);
-    }
-}
-
-// This core's Update.begin(U_SPIFFS) ignores its label and writes the first spiffs-subtype data partition,
-// so filesystem uploads are only offered when that partition is the configured one.
-const esp_partition_t* OTAManager::filesystemPartition() const {
-    if (partitionLabel_.isEmpty()) {
-        return nullptr;
-    }
-    const esp_partition_t* partition =
-        esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
-    return partition && partitionLabel_ == partition->label ? partition : nullptr;
-}
-
-// Basic only, as in the IDF sister; request->authenticate() would also accept a Digest response.
-bool OTAManager::authenticate(AsyncWebServerRequest* request) const {
-    if (username_.isEmpty() || password_.isEmpty()) {
-        return true;
-    }
-    return request->authType() == AsyncAuthType::AUTH_BASIC &&
-           request->authenticate(username_.c_str(), password_.c_str());
+    return success ? ESP_OK : ESP_FAIL;
 }

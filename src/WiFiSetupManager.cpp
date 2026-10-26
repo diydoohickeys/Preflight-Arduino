@@ -7,7 +7,13 @@
 #include "html/style_css.h"
 #include "html/theme_js.h"
 #include "SameOrigin.h"
+#include "HttpdRoute.h"
+#include "FormBody.h"
+#include "AccessGuard.h"
+#include "DeviceCert.h"
 #include <esp_ota_ops.h>
+#include <algorithm>
+#include <string>
 
 static bool runningImagePendingVerify() {
     const esp_partition_t* running = esp_ota_get_running_partition();
@@ -20,7 +26,7 @@ WiFiSetupManager::WiFiSetupManager(const WiFiSetupConfig& config)
     : config_(config)
     , hostName_("esp32-device")
     , initialized_(false)
-    , webServer_(nullptr)
+    , server_(nullptr)
     , stateMutex_(nullptr)
     , scanCompleted_(false)
     , lastScanMs_(0)
@@ -34,15 +40,10 @@ WiFiSetupManager::WiFiSetupManager(const WiFiSetupConfig& config)
     , beginMs_(0)
 {
     stateMutex_ = xSemaphoreCreateMutex();
-    webServer_ = new AsyncWebServer(config_.webServerPort);
 }
 
 WiFiSetupManager::~WiFiSetupManager() {
-    if (webServer_) {
-        webServer_->end();
-        delete webServer_;
-        webServer_ = nullptr;
-    }
+    stopWebServer();
     dnsServer_.stop();
     if (stateMutex_) {
         vSemaphoreDelete(stateMutex_);
@@ -61,7 +62,7 @@ void WiFiSetupManager::begin() {
         Logger.warning("New firmware on probation: kept once the device is reachable, rolled back otherwise");
     }
 
-    setupWebServer();
+    Access.begin();
 
     loadConfiguration();
 
@@ -84,7 +85,7 @@ void WiFiSetupManager::begin() {
             scanNetworks();
             startAPMode();
         } else {
-            webServer_->begin();
+            startWebServer();
         }
     }
 
@@ -281,6 +282,8 @@ bool WiFiSetupManager::connectToNetwork() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
+        // Persists across reconnects: the setting belongs to the station, not the association.
+        WiFi.setSleep(config_.wifiPowerSave);
         if (MDNS.begin(hostName_.c_str())) {
             MDNS.addService("http", "tcp", config_.webServerPort);
             Logger.info("mDNS started: %s.local", hostName_.c_str());
@@ -315,33 +318,14 @@ void WiFiSetupManager::startAPMode() {
 
     dnsServer_.start(config_.dnsPort, "*", WiFi.softAPIP());
 
-    // AP mode only: in STA mode the catch-all would turn the consumer's 404s into
-    // redirects to /setup.
-    registerCaptivePortalRoutes();
-
-    webServer_->begin();
+    startWebServer();
 
     if (config_.statusCallback) {
         config_.statusCallback->onAPMode(config_.defaultAPName, WiFi.softAPIP());
     }
 
     Logger.info("AP Name: %s", config_.defaultAPName.c_str());
-    Logger.info("Password: %s", config_.defaultAPPassword.c_str());
     Logger.info("IP address: %s", WiFi.softAPIP().toString().c_str());
-}
-
-void WiFiSetupManager::registerCaptivePortalRoutes() {
-    if (!webServer_) {
-        return;
-    }
-
-    webServer_->on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->redirect("/setup");
-    });
-
-    webServer_->onNotFound([](AsyncWebServerRequest* request) {
-        request->redirect("/setup");
-    });
 }
 
 void WiFiSetupManager::handleDNS() {
@@ -349,13 +333,15 @@ void WiFiSetupManager::handleDNS() {
 }
 
 void WiFiSetupManager::factoryReset() {
-    Logger.warning("Factory reset - clearing WiFi settings");
+    Logger.warning("Factory reset - clearing WiFi settings and the device password");
 
     Preferences prefs;
     if (prefs.begin(config_.preferencesNamespace.c_str(), false)) {
         prefs.clear();
         prefs.end();
     }
+    Access.clear();
+    wifisetup::clearDeviceCert();
 
     requestRestart();
 }
@@ -366,109 +352,73 @@ void WiFiSetupManager::requestRestart() {
     restartRequested_ = true;
 }
 
-void WiFiSetupManager::setupWebServer() {
-    if (!webServer_) {
+void WiFiSetupManager::startWebServer() {
+    if (server_) {
         return;
     }
 
-    // OS captive-portal probe URLs.
-    webServer_->on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->redirect("/setup");
-    });
-    webServer_->on("/fwlink", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->redirect("/setup");
-    });
-    webServer_->on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->redirect("/setup");
-    });
-    webServer_->on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->redirect("/setup");
-    });
-    webServer_->on("/redirect", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->redirect("/setup");
-    });
+    wifisetup::ServerOptions options;
+    options.httpPort = config_.webServerPort;
+    options.httpsPort = config_.httpsPort;
+    // Never in setup mode: a captive-portal browser can't accept a self-signed certificate.
+    options.https = config_.offerHttps && wifisetup::httpsChosen() && !isInSetupMode();
+    options.hostname = (hostName_.isEmpty() ? config_.defaultAPName : hostName_).c_str();
+    // Shared with the consumer's whole route table, one slot per method+path. Overflow
+    // is silent (the last registrations just fail), so the cap is generous.
+    options.maxUriHandlers = 176;
+    options.stackSize = 8192;
+    options.maxOpenSockets = config_.maxOpenSockets;
 
-    webServer_->on("/setup", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->send(200, "text/html", SETUP_HTML);
-    });
+    if (!host_.start(options)) {
+        return;
+    }
+    server_ = host_.handle();
+    Access.setHttps(host_.isHttps());
 
-    webServer_->on("/wifi-setup-style.css", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        String css = STYLE_CSS;
+    const httpd_uri_t routes[] = {
+        wifisetup::route("/setup", HTTP_GET, handleSetupPage, this),
+        wifisetup::route("/wifi-setup-style.css", HTTP_GET, handleStyleCss, this),
+        wifisetup::route("/wifi-setup-theme.js", HTTP_GET, handleThemeJs, this),
+        wifisetup::route("/get-networks", HTTP_GET, handleGetNetworks, this),
+        wifisetup::route("/get-current-settings", HTTP_GET, handleGetCurrentSettings, this),
+        wifisetup::route("/save-wifi", HTTP_POST, handleSaveWiFi, this),
+        wifisetup::route("/factory-reset", HTTP_GET, handleFactoryReset, this),
+        wifisetup::route("/factory-reset", HTTP_POST, handleFactoryReset, this),
+    };
+    for (const httpd_uri_t& r : routes) {
+        httpd_register_uri_handler(server_, &r);
+    }
 
-        // Appended after the static sheet so the overrides win on equal specificity.
-        if (config_.theme) {
-            String overrides = "\n:root {\n";
+    Access.registerEndpoints(server_);
+    if (config_.offerHttps) {
+        wifisetup::registerDeviceCertEndpoints(server_);
+    }
 
-            if (config_.theme->webPrimaryColor.length() > 0) {
-                overrides += "  --accent: " + config_.theme->webPrimaryColor + ";\n";
-            }
-            if (config_.theme->webPrimaryDark.length() > 0) {
-                overrides += "  --accent-dark: " + config_.theme->webPrimaryDark + ";\n";
-            }
-            if (config_.theme->webBackgroundColor.length() > 0) {
-                overrides += "  --bg: " + config_.theme->webBackgroundColor + ";\n";
-            }
-            if (config_.theme->webSurfaceColor.length() > 0) {
-                overrides += "  --card: " + config_.theme->webSurfaceColor + ";\n";
-            }
-            if (config_.theme->webTextColor.length() > 0) {
-                overrides += "  --text: " + config_.theme->webTextColor + ";\n";
-            }
-            if (config_.theme->webTextSecondary.length() > 0) {
-                overrides += "  --text-dim: " + config_.theme->webTextSecondary + ";\n";
-            }
-            if (config_.theme->webBorderColor.length() > 0) {
-                overrides += "  --border: " + config_.theme->webBorderColor + ";\n";
-            }
+    if (isInSetupMode()) {
+        registerCaptivePortalRoutes();
+    }
+}
 
-            for (const auto& var : config_.theme->cssVariables) {
-                overrides += "  --" + var.first + ": " + var.second + ";\n";
-            }
+void WiFiSetupManager::stopWebServer() {
+    host_.stop();
+    server_ = nullptr;
+}
 
-            overrides += "}\n";
-
-            // The select arrow is an SVG data URL: its fill needs its own override, with
-            // the '#' percent-encoded or it terminates the URL.
-            if (config_.theme->webPrimaryColor.length() > 0) {
-                String color = config_.theme->webPrimaryColor;
-                color.replace("#", "%23");
-                overrides += "select { background-image: url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='" + color + "' viewBox='0 0 16 16'%3e%3cpath d='M8 11L3 6h10z'/%3e%3c/svg%3e\"); }\n";
-            }
-
-            if (config_.theme->customCSS.length() > 0) {
-                overrides += config_.theme->customCSS + "\n";
-            }
-
-            css += overrides;
-        }
-
-        request->send(200, "text/css", css);
-    });
-
-    webServer_->on("/wifi-setup-theme.js", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->send(200, "text/javascript", THEME_JS);
-    });
-
-    webServer_->on("/get-networks", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        handleGetNetworks(request);
-    });
-
-    webServer_->on("/get-current-settings", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        handleGetCurrentSettings(request);
-    });
-
-    webServer_->on("/save-wifi", HTTP_POST, [this](AsyncWebServerRequest* request) {
-        handleSaveWiFi(request);
-    });
-
-    // GET is the confirmation page, never the action.
-    webServer_->on("/factory-reset", HTTP_GET, [](AsyncWebServerRequest* request) {
-        request->send(200, "text/html", FACTORY_RESET_CONFIRM_HTML);
-    });
-
-    webServer_->on("/factory-reset", HTTP_POST, [this](AsyncWebServerRequest* request) {
-        handleFactoryResetRequest(request);
-    });
+// AP mode only: in STA mode the catch-all would turn the consumer's 404s into redirects to /setup.
+void WiFiSetupManager::registerCaptivePortalRoutes() {
+    const httpd_uri_t probes[] = {
+        wifisetup::route("/", HTTP_GET, handleCaptiveRedirect, this),
+        wifisetup::route("/generate_204", HTTP_GET, handleCaptiveRedirect, this),
+        wifisetup::route("/fwlink", HTTP_GET, handleCaptiveRedirect, this),
+        wifisetup::route("/connecttest.txt", HTTP_GET, handleCaptiveRedirect, this),
+        wifisetup::route("/hotspot-detect.html", HTTP_GET, handleCaptiveRedirect, this),
+        wifisetup::route("/redirect", HTTP_GET, handleCaptiveRedirect, this),
+    };
+    for (const httpd_uri_t& r : probes) {
+        httpd_register_uri_handler(server_, &r);
+    }
+    // Any other URL a phone probes with also lands on the portal.
+    httpd_register_err_handler(server_, HTTPD_404_NOT_FOUND, handleNotFound);
 }
 
 String WiFiSetupManager::jsonEscape(const String& in) {
@@ -525,34 +475,118 @@ String WiFiSetupManager::listEscape(const String& in) {
     return out;
 }
 
-void WiFiSetupManager::handleGetNetworks(AsyncWebServerRequest* request) {
+esp_err_t WiFiSetupManager::handleCaptiveRedirect(httpd_req_t* req) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/setup");
+    return httpd_resp_send(req, nullptr, 0);
+}
+
+esp_err_t WiFiSetupManager::handleNotFound(httpd_req_t* req, httpd_err_code_t) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/setup");
+    httpd_resp_send(req, nullptr, 0);
+    return ESP_OK;
+}
+
+esp_err_t WiFiSetupManager::handleSetupPage(httpd_req_t* req) {
+    if (!Access.allowSetup(req)) {
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, SETUP_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+esp_err_t WiFiSetupManager::handleStyleCss(httpd_req_t* req) {
+    auto* self = static_cast<WiFiSetupManager*>(req->user_ctx);
+    httpd_resp_set_type(req, "text/css");
+    httpd_resp_send_chunk(req, STYLE_CSS, HTTPD_RESP_USE_STRLEN);
+
+    // Appended after the static sheet so the overrides win on equal specificity.
+    const WiFiSetupTheme* theme = self ? self->config_.theme : nullptr;
+    if (theme) {
+        String overrides = "\n:root {\n";
+        auto addVar = [&overrides](const char* name, const String& value) {
+            if (value.length() > 0) {
+                overrides += "  ";
+                overrides += name;
+                overrides += ": " + value + ";\n";
+            }
+        };
+        addVar("--accent", theme->webPrimaryColor);
+        addVar("--accent-dark", theme->webPrimaryDark);
+        addVar("--bg", theme->webBackgroundColor);
+        addVar("--card", theme->webSurfaceColor);
+        addVar("--text", theme->webTextColor);
+        addVar("--text-dim", theme->webTextSecondary);
+        addVar("--border", theme->webBorderColor);
+        for (const auto& var : theme->cssVariables) {
+            overrides += "  --" + var.first + ": " + var.second + ";\n";
+        }
+        overrides += "}\n";
+
+        // The select arrow is an SVG data URL: its fill needs its own override, with
+        // the '#' percent-encoded or it terminates the URL.
+        if (theme->webPrimaryColor.length() > 0) {
+            String color = theme->webPrimaryColor;
+            color.replace("#", "%23");
+            overrides += "select { background-image: url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='" + color + "' viewBox='0 0 16 16'%3e%3cpath d='M8 11L3 6h10z'/%3e%3c/svg%3e\"); }\n";
+        }
+
+        if (theme->customCSS.length() > 0) {
+            overrides += theme->customCSS + "\n";
+        }
+
+        httpd_resp_send_chunk(req, overrides.c_str(), overrides.length());
+    }
+
+    return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+esp_err_t WiFiSetupManager::handleThemeJs(httpd_req_t* req) {
+    httpd_resp_set_type(req, "text/javascript");
+    return httpd_resp_send(req, THEME_JS, HTTPD_RESP_USE_STRLEN);
+}
+
+esp_err_t WiFiSetupManager::handleGetNetworks(httpd_req_t* req) {
+    auto* self = static_cast<WiFiSetupManager*>(req->user_ctx);
+    if (!Access.allowSetup(req)) {
+        return ESP_OK;
+    }
+
     // Cold on a normal STA boot (the boot scan is lazy); update() runs the scan and the
     // page polls on 202.
     String networks;
-    if (!getFreshScan(networks)) {
-        scanRequested_ = true;
-        request->send(202, "text/plain", "SCANNING");
-        return;
+    if (!self->getFreshScan(networks)) {
+        self->scanRequested_ = true;
+        httpd_resp_set_status(req, "202 Accepted");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "SCANNING");
     }
 
-    request->send(200, "text/plain", networks);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, networks.c_str(), networks.length());
 }
 
-void WiFiSetupManager::handleGetCurrentSettings(AsyncWebServerRequest* request) {
+esp_err_t WiFiSetupManager::handleGetCurrentSettings(httpd_req_t* req) {
+    auto* self = static_cast<WiFiSetupManager*>(req->user_ctx);
+    if (!Access.allowSetup(req)) {
+        return ESP_OK;
+    }
+
     String networkName;
     String wifiSSID;
     bool hasSettings = false;
     bool hasPassword = false;
 
-    // A Preferences handle per use: this is the AsyncTCP task, and a shared one's end()
+    // A Preferences handle per use: this is the httpd task, and a shared one's end()
     // would close the handle mid-read on the app task.
     Preferences prefs;
-    if (prefs.begin(config_.preferencesNamespace.c_str(), true)) {
-        hasSettings = prefs.isKey(config_.deviceNameKey.c_str());
-        networkName = prefs.getString(config_.deviceNameKey.c_str(), "");
-        wifiSSID = prefs.getString(config_.ssidKey.c_str(), "");
-        hasPassword = prefs.isKey(config_.passwordKey.c_str()) &&
-                      !prefs.getString(config_.passwordKey.c_str(), "").isEmpty();
+    if (prefs.begin(self->config_.preferencesNamespace.c_str(), true)) {
+        hasSettings = prefs.isKey(self->config_.deviceNameKey.c_str());
+        networkName = prefs.getString(self->config_.deviceNameKey.c_str(), "");
+        wifiSSID = prefs.getString(self->config_.ssidKey.c_str(), "");
+        hasPassword = prefs.isKey(self->config_.passwordKey.c_str()) &&
+                      !prefs.getString(self->config_.passwordKey.c_str(), "").isEmpty();
         prefs.end();
     }
 
@@ -561,31 +595,39 @@ void WiFiSetupManager::handleGetCurrentSettings(AsyncWebServerRequest* request) 
     json += "\"hasSettings\":" + String(hasSettings ? "true" : "false") + ",";
     json += "\"networkName\":\"" + jsonEscape(networkName) + "\",";
     json += "\"wifiSSID\":\"" + jsonEscape(wifiSSID) + "\",";
-    json += "\"hasPassword\":" + String(hasPassword ? "true" : "false");
+    json += "\"hasPassword\":" + String(hasPassword ? "true" : "false") + ",";
+    json += "\"hasDevicePassword\":" + String(Access.hasPassword() ? "true" : "false");
     json += "}";
 
-    request->send(200, "application/json", json);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json.c_str(), json.length());
 }
 
-void WiFiSetupManager::handleSaveWiFi(AsyncWebServerRequest* request) {
-    if (!wifisetup::isSameOrigin(request)) {
-        wifisetup::sendCrossOriginRefused(request);
-        return;
+// Refusals before the body is read return ESP_FAIL, so httpd closes the socket instead of
+// draining it.
+esp_err_t WiFiSetupManager::handleSaveWiFi(httpd_req_t* req) {
+    auto* self = static_cast<WiFiSetupManager*>(req->user_ctx);
+
+    if (!wifisetup::isSameOrigin(req)) {
+        wifisetup::sendCrossOriginRefused(req);
+        return ESP_FAIL;
+    }
+    if (!Access.allowSetup(req)) {
+        return ESP_FAIL;
     }
 
-    String networkName = "";
-    String wifiNetwork = "";
-    String wifiPassword = "";
+    std::string body;
+    if (!wifisetup::readFormBody(req, body)) {
+        return ESP_FAIL;
+    }
 
-    if (request->hasParam("network_name", true)) {
-        networkName = request->getParam("network_name", true)->value();
-    }
-    if (request->hasParam("wifi_network", true)) {
-        wifiNetwork = request->getParam("wifi_network", true)->value();
-    }
-    if (request->hasParam("wifi_password", true)) {
-        wifiPassword = request->getParam("wifi_password", true)->value();
-    }
+    String networkName = wifisetup::formValue(body, "network_name").c_str();
+    String wifiNetwork = wifisetup::formValue(body, "wifi_network").c_str();
+    String wifiPassword = wifisetup::formValue(body, "wifi_password").c_str();
+    // Only the first save chooses the device password; later ones change it on /setup's Access card.
+    const bool choosingPassword = !Access.hasPassword();
+    std::string devicePassword = choosingPassword ? wifisetup::formValue(body, "device_password") : std::string();
+    std::fill(body.begin(), body.end(), '\0');
 
     // mDNS labels are lowercase [a-z0-9-] and a space breaks resolution:
     // "My Device" becomes "my-device".
@@ -610,33 +652,45 @@ void WiFiSetupManager::handleSaveWiFi(AsyncWebServerRequest* request) {
     else if (wifiNetwork.isEmpty())                     reason = "WiFi network is required";
     else if (wifiNetwork.length() > SSID_MAX_BYTES)       reason = "WiFi network name is too long (max 32 bytes)";
     else if (wifiPassword.length() > PASSWORD_MAX_BYTES)  reason = "WiFi password is too long (max 63 bytes)";
+    else if (choosingPassword && (devicePassword.size() < AccessGuardClass::MIN_PASSWORD ||
+                                  devicePassword.size() > AccessGuardClass::MAX_PASSWORD))
+        reason = "Device password must be 8-64 characters";
     if (reason) {
         Logger.warning("Rejected WiFi settings: %s", reason);
-        request->send(400, "text/plain", reason);
-        return;
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, reason);
+        return ESP_FAIL;
+    }
+
+    if (choosingPassword) {
+        const bool set = Access.setPassword(devicePassword.c_str());
+        std::fill(devicePassword.begin(), devicePassword.end(), '\0');
+        if (!set) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save the device password");
+            return ESP_FAIL;
+        }
     }
 
     bool saved = false;
     {
         Preferences prefs;
-        if (prefs.begin(config_.preferencesNamespace.c_str(), false)) {
+        if (prefs.begin(self->config_.preferencesNamespace.c_str(), false)) {
             // The page leaves the field blank to keep the saved password of the saved network.
-            const bool keepPassword = wifiPassword.isEmpty() && prefs.isKey(config_.ssidKey.c_str()) &&
-                                      wifiNetwork == prefs.getString(config_.ssidKey.c_str(), "");
-            saved = prefs.putString(config_.deviceNameKey.c_str(), networkName) > 0
-                 && prefs.putString(config_.ssidKey.c_str(), wifiNetwork) > 0;
+            const bool keepPassword = wifiPassword.isEmpty() && prefs.isKey(self->config_.ssidKey.c_str()) &&
+                                      wifiNetwork == prefs.getString(self->config_.ssidKey.c_str(), "");
+            saved = prefs.putString(self->config_.deviceNameKey.c_str(), networkName) > 0
+                 && prefs.putString(self->config_.ssidKey.c_str(), wifiNetwork) > 0;
             // putString returns 0 for an empty (open-network) password, so it cannot
             // be part of the success test.
             if (!keepPassword) {
-                prefs.putString(config_.passwordKey.c_str(), wifiPassword);
+                prefs.putString(self->config_.passwordKey.c_str(), wifiPassword);
             }
             prefs.end();
         }
     }
     if (!saved) {
         Logger.error("Failed to store WiFi settings");
-        request->send(500, "text/plain", "Could not save settings to flash");
-        return;
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save settings to flash");
+        return ESP_FAIL;
     }
 
     Logger.info("WiFi settings saved: Host=%s, SSID=%s", networkName.c_str(), wifiNetwork.c_str());
@@ -646,36 +700,56 @@ void WiFiSetupManager::handleSaveWiFi(AsyncWebServerRequest* request) {
     html.replace("%NETWORK_NAME%", htmlEscape(networkName));
     html.replace("%WIFI_NETWORK%", htmlEscape(wifiNetwork));
 
-    request->send(200, "text/html", html);
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html.c_str(), html.length());
 
-    requestRestart();
+    self->requestRestart();
+    return ESP_OK;
 }
 
-void WiFiSetupManager::handleFactoryResetRequest(AsyncWebServerRequest* request) {
-    if (!wifisetup::isSameOrigin(request)) {
-        wifisetup::sendCrossOriginRefused(request);
-        return;
+esp_err_t WiFiSetupManager::handleFactoryReset(httpd_req_t* req) {
+    auto* self = static_cast<WiFiSetupManager*>(req->user_ctx);
+
+    if (req->method != HTTP_POST) {
+        // GET is the confirmation page, never the action.
+        if (!Access.allowSetup(req)) {
+            return ESP_OK;
+        }
+        httpd_resp_set_type(req, "text/html");
+        return httpd_resp_send(req, FACTORY_RESET_CONFIRM_HTML, HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (!wifisetup::isSameOrigin(req)) {
+        wifisetup::sendCrossOriginRefused(req);
+        return ESP_FAIL;
+    }
+    if (!Access.allowSetup(req)) {
+        return ESP_FAIL;
+    }
+    std::string body;
+    if (!wifisetup::readFormBody(req, body)) {
+        return ESP_FAIL;
     }
 
     // Cross-site forms are refused above; the fixed token the confirmation page posts
-    // only stops an accidental reset, as any client on the network can send it.
-    bool confirmed = request->hasParam("confirm", true) &&
-                     request->getParam("confirm", true)->value() == "RESET";
-    if (!confirmed) {
+    // only stops an accidental reset.
+    if (wifisetup::formValue(body, "confirm") != "RESET") {
         Logger.warning("Factory reset rejected - missing confirmation");
-        request->send(400, "text/plain", "Factory reset requires confirmation");
-        return;
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Factory reset requires confirmation");
+        return ESP_FAIL;
     }
 
     Logger.warning("Factory reset requested via web UI");
 
-    request->send(200, "text/html", FACTORY_RESET_HTML);
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, FACTORY_RESET_HTML, HTTPD_RESP_USE_STRLEN);
 
-    factoryReset();
+    self->factoryReset();
+    return ESP_OK;
 }
 
 void WiFiSetupManager::enableLogger(size_t maxLogEntries) {
     Logger.begin(maxLogEntries, true);
-    Logger.registerEndpoints(webServer_);
+    Logger.registerEndpoints(server_);
     Logger.info("Logger enabled with %zu max entries", maxLogEntries);
 }

@@ -5,12 +5,13 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <DNSServer.h>
-#include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
+#include <esp_http_server.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <atomic>
 #include <map>
+#include "ServerHost.h"
 
 // Colours for the LVGL boot screen and the web portal; every field has a default.
 struct WiFiSetupTheme {
@@ -59,6 +60,24 @@ struct WiFiSetupConfig {
     String ssidKey = "ssid";
     String passwordKey = "password";
     uint16_t webServerPort = 80;
+    // Puts an HTTPS switch on /setup, off until the user turns it on (the device restarts). On, the
+    // pages and every consumer route are served on httpsPort once joined to WiFi, with a device-made
+    // certificate (self-signed, or signed by the user's CA via tools/preflight-certs.ps1) and
+    // webServerPort redirecting to it. The setup portal stays plain HTTP: captive-portal browsers
+    // can't accept a certificate. Needs CONFIG_ESP_HTTPS_SERVER_ENABLE and
+    // CONFIG_MBEDTLS_X509_CREATE_C; falls back to HTTP.
+    bool offerHttps = false;
+    uint16_t httpsPort = 443;
+    // Concurrent connections the server keeps open (HTTPS takes three of them for the port-80
+    // redirect). Each TLS connection holds ~30 KB of mbedTLS buffers, in internal RAM unless
+    // CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: lower this on a board with no PSRAM.
+    // 12 by default: httpd's own 7 lets browser keep-alives squeeze out a consumer's long-lived
+    // WebSocket, and CONFIG_LWIP_MAX_SOCKETS=16 minus httpd's reserved sockets caps it at 13.
+    uint16_t maxOpenSockets = 12;
+    // WiFi modem sleep. Off by default: asleep, the radio wakes only every DTIM beacon (~100 ms),
+    // so every round trip pays up to that — ping swung 5-206 ms at idle, and a TLS handshake plus a
+    // page load is dozens of round trips (10-15 s pages). Turn it on only for a battery device.
+    bool wifiPowerSave = false;
     uint16_t dnsPort = 53;
     uint8_t maxConnectionAttempts = 10;
     uint16_t connectionTimeout = 500;               // ms per attempt
@@ -97,8 +116,14 @@ public:
     String getSSID() const { return wifiSsid_; }
     const WiFiSetupTheme* getTheme() const { return config_.theme; }
 
-    // For adding the consumer's own routes
-    AsyncWebServer* getWebServer() { return webServer_; }
+    // For adding the consumer's own routes (esp_http_server; nullptr before begin()).
+    httpd_handle_t getWebServer() { return server_; }
+    // Whether getWebServer() is the HTTPS server (false in setup mode and on fallback).
+    bool isHttps() const { return host_.isHttps(); }
+
+    // Replaces the status callback; nullptr detaches it. Detach BEFORE destroying the callback
+    // object (a boot screen torn down after boot): a /get-networks rescan still reports through it.
+    void setStatusCallback(WiFiStatusCallback* callback) { config_.statusCallback = callback; }
 
     // Starts Logger and serves its endpoints (/logs, /api/logs, ...); call after begin().
     void enableLogger(size_t maxLogEntries = 100);
@@ -116,19 +141,21 @@ private:
     bool initialized_;
 
     DNSServer dnsServer_;
-    AsyncWebServer* webServer_;
+    wifisetup::ServerHost host_;
+    httpd_handle_t server_;  // host_.handle() once started
 
-    // Guards the scan result and its time: written by update(), read on the AsyncTCP task.
+    // Guards the scan result and its time: written by update(), read on the httpd task.
     SemaphoreHandle_t stateMutex_;
     bool scanCompleted_;
     unsigned long lastScanMs_;
 
-    // Deferred to update(): request->send() only queues, so restarting in a handler
-    // means the page is never transmitted.
+    // Deferred to update() so the response is flushed first and the httpd task is not
+    // held for the delay.
     std::atomic<bool> restartRequested_;
     std::atomic<unsigned long> restartTime_;
 
-    // A scan blocks for seconds, which must not happen on the AsyncTCP task.
+    // A scan blocks for seconds; update() runs it and the page polls, so the shared httpd task
+    // (and every consumer route on it) is never held for one.
     std::atomic<bool> scanRequested_;
 
     bool staWantsConnection_;
@@ -166,12 +193,19 @@ private:
     static String htmlEscape(const String& in);
     static String listEscape(const String& in);
 
-    void setupWebServer();
-    void handleGetNetworks(AsyncWebServerRequest* request);
-    void handleGetCurrentSettings(AsyncWebServerRequest* request);
-    void handleSaveWiFi(AsyncWebServerRequest* request);
-    void handleFactoryResetRequest(AsyncWebServerRequest* request);
+    void startWebServer();
+    void stopWebServer();
     void registerCaptivePortalRoutes();
+
+    static esp_err_t handleSetupPage(httpd_req_t* req);
+    static esp_err_t handleStyleCss(httpd_req_t* req);
+    static esp_err_t handleThemeJs(httpd_req_t* req);
+    static esp_err_t handleGetNetworks(httpd_req_t* req);
+    static esp_err_t handleGetCurrentSettings(httpd_req_t* req);
+    static esp_err_t handleSaveWiFi(httpd_req_t* req);
+    static esp_err_t handleFactoryReset(httpd_req_t* req);
+    static esp_err_t handleCaptiveRedirect(httpd_req_t* req);
+    static esp_err_t handleNotFound(httpd_req_t* req, httpd_err_code_t error);
 };
 
 #endif // WIFI_SETUP_MANAGER_H

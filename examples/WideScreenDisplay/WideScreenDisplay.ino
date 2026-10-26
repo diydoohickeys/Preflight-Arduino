@@ -59,7 +59,7 @@ void setup() {
         ota.setScreenProgressCallback([](uint8_t progress, OTAManager::Stage stage) {
             Logger.debug("OTA %u%% (stage %d)", progress, static_cast<int>(stage));
         });
-        ota.begin(wifi->getWebServer(), "admin", "change-me", "");
+        ota.begin(wifi->getWebServer(), "");
     }
 }
 

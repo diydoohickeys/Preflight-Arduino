@@ -1,40 +1,50 @@
 #ifndef WIFI_SETUP_SAME_ORIGIN_H
 #define WIFI_SETUP_SAME_ORIGIN_H
 
-#include <Arduino.h>
-#include <ESPAsyncWebServer.h>
+#include <cstring>
+#include <strings.h>
+#include "esp_http_server.h"
 
 namespace wifisetup {
 
 // Guards state-changing POSTs against cross-site requests. Browsers send Origin (or at
 // least Referer) on a cross-site POST; tools and scripts send neither, so an absent header
 // passes. An "Origin: null" (sandboxed frame, file://) has no authority and is refused.
-inline bool isSameOrigin(AsyncWebServerRequest* request) {
-    const AsyncWebHeader* source = request->getHeader("Origin");
-    if (!source) {
-        source = request->getHeader("Referer");
+inline bool isSameOrigin(httpd_req_t* req) {
+    char source[256];
+    esp_err_t err = httpd_req_get_hdr_value_str(req, "Origin", source, sizeof(source));
+    if (err == ESP_ERR_NOT_FOUND) {
+        err = httpd_req_get_hdr_value_str(req, "Referer", source, sizeof(source));
     }
-    if (!source) {
+    if (err == ESP_ERR_NOT_FOUND) {
         return true;
     }
-    const AsyncWebHeader* host = request->getHeader("Host");
-    if (!host) {
+    // A long Referer is truncated to the buffer; only its leading authority is needed.
+    if (err != ESP_OK && err != ESP_ERR_HTTPD_RESULT_TRUNC) {
         return false;
     }
 
-    const String& value = source->value();
-    int start = value.indexOf("://");
-    if (start < 0) {
+    char host[128];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
         return false;
     }
-    start += 3;
-    int end = value.indexOf('/', start);
-    String authority = end < 0 ? value.substring(start) : value.substring(start, end);
-    return authority.equalsIgnoreCase(host->value());
+
+    const char* authority = strstr(source, "://");
+    if (!authority) {
+        return false;
+    }
+    authority += 3;
+    const size_t length = strcspn(authority, "/");
+    if (authority[length] == '\0' && err == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        return false;
+    }
+    return length == strlen(host) && strncasecmp(authority, host, length) == 0;
 }
 
-inline void sendCrossOriginRefused(AsyncWebServerRequest* request) {
-    request->send(403, "text/plain", "Cross-origin request refused");
+inline esp_err_t sendCrossOriginRefused(httpd_req_t* req) {
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "Cross-origin request refused");
 }
 
 }  // namespace wifisetup

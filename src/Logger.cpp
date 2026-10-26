@@ -1,11 +1,11 @@
 #include "Logger.h"
 #include "SameOrigin.h"
+#include "HttpdRoute.h"
+#include "AccessGuard.h"
 #include "html/logs_html.h"
-#include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <memory>
+#include <cstdlib>
 #if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
 #include "esp_core_dump.h"
 #include "esp_partition.h"
@@ -21,57 +21,75 @@ namespace {
     class MutexLock {
     public:
         explicit MutexLock(SemaphoreHandle_t mutex)
-            : mutex_(mutex)
-            , held_(mutex != nullptr && xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {}
+            : _mutex(mutex)
+            , _held(mutex != nullptr && xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {}
         ~MutexLock() {
-            if (held_) xSemaphoreGive(mutex_);
+            if (_held) xSemaphoreGive(_mutex);
         }
         MutexLock(const MutexLock&) = delete;
         MutexLock& operator=(const MutexLock&) = delete;
 
-        bool held() const { return held_; }
+        bool held() const { return _held; }
 
     private:
-        SemaphoreHandle_t mutex_;
-        bool held_;
+        SemaphoreHandle_t _mutex;
+        bool _held;
     };
 
+    void replaceAll(std::string& s, const std::string& from, const std::string& to) {
+        if (from.empty()) return;
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+    }
+
     // Only template text is substituted, never the entries: a logged message may contain a marker.
-    String logsPageSlice(const char* text, size_t length, size_t total, bool webSocket) {
-        String slice(text, (unsigned int)length);
-        slice.replace("%LOG_COUNT%", String((unsigned long)total));
-        slice.replace("%LOG_WS%", webSocket ? "true" : "false");
+    std::string logsPageSlice(const char* text, size_t length, size_t total, bool webSocket) {
+        std::string slice(text, length);
+        replaceAll(slice, "%LOG_COUNT%", std::to_string(total));
+        replaceAll(slice, "%LOG_WS%", webSocket ? "true" : "false");
         return slice;
     }
 }
 
 LoggerClass Logger;
 
+const char* LoggerClass::TAG = "Logger";
+
 LoggerClass::LoggerClass()
-    : maxEntries_(100)
-    , serialEnabled_(true)
-    , webSocketEnabled_(true)
-    , minLevel_(LOG_INFO)
-    , mutex_(nullptr)
-    , webSocket_(nullptr)
+    : _maxEntries(100)
+    , _serialEnabled(true)
+    , _minLevel(LOG_INFO)
+    , _mutex(nullptr)
 {
 }
 
 void LoggerClass::begin(size_t maxEntries, bool enableSerial, bool enableWebSocket) {
-    maxEntries_ = maxEntries;
-    serialEnabled_ = enableSerial;
-    webSocketEnabled_ = enableWebSocket;
+    _maxEntries = maxEntries;
+    _serialEnabled = enableSerial;
+    _webSocketEnabled = enableWebSocket;
 
-    if (mutex_ == nullptr) {
-        mutex_ = xSemaphoreCreateMutex();
+    if (_mutex == nullptr) {
+        _mutex = xSemaphoreCreateMutex();
     }
+
+#if defined(ARDUINO) && ARDUINO_USB_CDC_ON_BOOT
+    // USB CDC waits up to 20 x the TX timeout per write while the host has the port open but
+    // isn't reading it - 2 s a line at the default, on whichever task logged. A line nobody is
+    // reading is dropped instead; the buffer and /logs still have it.
+    if (enableSerial) {
+        Serial.setTxTimeoutMs(0);
+    }
+#endif
 
     info("Logger started, buffering %u entries", (unsigned)maxEntries);
 }
 
 // Filter before formatting: a filtered debug() costs one compare, not a vsnprintf.
 void LoggerClass::log(LogLevel level, const char* format, ...) {
-    if (level < minLevel_) return;
+    if (level < _minLevel) return;
     char buffer[256];
     va_list args;
     va_start(args, format);
@@ -82,7 +100,7 @@ void LoggerClass::log(LogLevel level, const char* format, ...) {
 }
 
 void LoggerClass::debug(const char* format, ...) {
-    if (LOG_DEBUG < minLevel_) return;
+    if (LOG_DEBUG < _minLevel) return;
     char buffer[256];
     va_list args;
     va_start(args, format);
@@ -93,7 +111,7 @@ void LoggerClass::debug(const char* format, ...) {
 }
 
 void LoggerClass::info(const char* format, ...) {
-    if (LOG_INFO < minLevel_) return;
+    if (LOG_INFO < _minLevel) return;
     char buffer[256];
     va_list args;
     va_start(args, format);
@@ -104,7 +122,7 @@ void LoggerClass::info(const char* format, ...) {
 }
 
 void LoggerClass::warning(const char* format, ...) {
-    if (LOG_WARNING < minLevel_) return;
+    if (LOG_WARNING < _minLevel) return;
     char buffer[256];
     va_list args;
     va_start(args, format);
@@ -115,7 +133,7 @@ void LoggerClass::warning(const char* format, ...) {
 }
 
 void LoggerClass::error(const char* format, ...) {
-    if (LOG_ERROR < minLevel_) return;
+    if (LOG_ERROR < _minLevel) return;
     char buffer[256];
     va_list args;
     va_start(args, format);
@@ -125,63 +143,65 @@ void LoggerClass::error(const char* format, ...) {
     addEntry(LOG_ERROR, buffer);
 }
 
-void LoggerClass::log(LogLevel level, const String& message) {
+void LoggerClass::log(LogLevel level, const std::string& message) {
     addEntry(level, message.c_str());
 }
 
-void LoggerClass::debug(const String& message) {
+void LoggerClass::debug(const std::string& message) {
     addEntry(LOG_DEBUG, message.c_str());
 }
 
-void LoggerClass::info(const String& message) {
+void LoggerClass::info(const std::string& message) {
     addEntry(LOG_INFO, message.c_str());
 }
 
-void LoggerClass::warning(const String& message) {
+void LoggerClass::warning(const std::string& message) {
     addEntry(LOG_WARNING, message.c_str());
 }
 
-void LoggerClass::error(const String& message) {
+void LoggerClass::error(const std::string& message) {
     addEntry(LOG_ERROR, message.c_str());
 }
 
+#ifdef ARDUINO
+void LoggerClass::log(LogLevel level, const String& message) { addEntry(level, message.c_str()); }
+void LoggerClass::debug(const String& message) { addEntry(LOG_DEBUG, message.c_str()); }
+void LoggerClass::info(const String& message) { addEntry(LOG_INFO, message.c_str()); }
+void LoggerClass::warning(const String& message) { addEntry(LOG_WARNING, message.c_str()); }
+void LoggerClass::error(const String& message) { addEntry(LOG_ERROR, message.c_str()); }
+#endif
+
 void LoggerClass::addEntry(LogLevel level, const char* message) {
-    if (level < minLevel_) {
+    if (level < _minLevel) {
         return;
     }
 
-    const unsigned long timestamp = millis();
+    const uint32_t timestamp = getMillis();
 
     // Runs from any context, including C callbacks where an escaping exception terminate()s:
     // an allocation failure drops the line (counted). Never log from the catch - it re-enters.
     bool buffered = false;
-    if (mutex_ && maxEntries_ > 0) {
+    if (_mutex && _maxEntries > 0) {
         try {
             LogEntry newEntry(timestamp, level, message);
-            MutexLock lock(mutex_);
+            MutexLock lock(_mutex);
             if (lock.held()) {
-                while (entries_.size() >= maxEntries_) {
-                    entries_.pop_front();
+                while (_entries.size() >= _maxEntries) {
+                    _entries.pop_front();
                 }
-                entries_.push_back(std::move(newEntry));
+                _entries.push_back(std::move(newEntry));
                 buffered = true;
             }
         } catch (...) {
         }
     }
     // begin(0) turns buffering off by choice; that is not a loss.
-    if (!buffered && maxEntries_ > 0) {
-        droppedEntries_.fetch_add(1, std::memory_order_relaxed);
+    if (!buffered && _maxEntries > 0) {
+        _droppedEntries.fetch_add(1, std::memory_order_relaxed);
     }
 
-    if (serialEnabled_) {
-        printToSerial(timestamp, level, message);
-    }
-
-    try {
-        broadcastLogEntry(timestamp, level, message);
-    } catch (...) {
-        // Only the live push is lost; the buffered copy survives, so it is not counted as dropped.
+    if (_serialEnabled) {
+        printToSerial(level, message);
     }
 
     if (inOutputCallback) {
@@ -190,8 +210,8 @@ void LoggerClass::addEntry(LogLevel level, const char* message) {
     try {
         std::shared_ptr<const LogOutputCallback> callback;
         {
-            MutexLock lock(mutex_);
-            callback = outputCallback_;
+            MutexLock lock(_mutex);
+            callback = _outputCallback;
         }
         if (callback && *callback) {
             inOutputCallback = true;
@@ -210,58 +230,58 @@ void LoggerClass::setOutputCallback(LogOutputCallback callback) {
         next = std::make_shared<LogOutputCallback>(std::move(callback));
     }
     // Swapped, not assigned: the old callback is destroyed after the lock is released.
-    MutexLock lock(mutex_);
-    outputCallback_.swap(next);
+    MutexLock lock(_mutex);
+    _outputCallback.swap(next);
 }
 
 std::vector<LogEntry> LoggerClass::getEntries(size_t maxEntries) const {
     std::vector<LogEntry> snapshot;
-    MutexLock lock(mutex_);
+    MutexLock lock(_mutex);
     if (!lock.held()) return snapshot;
-    const size_t total = entries_.size();
+    const size_t total = _entries.size();
     const size_t start = (maxEntries > 0 && total > maxEntries) ? total - maxEntries : 0;
-    snapshot.assign(entries_.begin() + static_cast<std::ptrdiff_t>(start), entries_.end());
+    snapshot.assign(_entries.begin() + static_cast<std::ptrdiff_t>(start), _entries.end());
     return snapshot;
 }
 
-void LoggerClass::printToSerial(unsigned long ms, LogLevel level, const char* message) {
-    unsigned long seconds = ms / 1000;
-    unsigned long minutes = seconds / 60;
-    unsigned long hours = minutes / 60;
-    unsigned long days = hours / 24;
-
-    seconds %= 60;
-    minutes %= 60;
-    hours %= 24;
-
-    Serial.print("[");
-
-    if (days > 0) {
-        Serial.print(days);
-        Serial.print("d ");
-    }
-
-    if (hours > 0 || days > 0) {
-        Serial.print(hours);
-        Serial.print("h ");
-    }
-
-    if (minutes > 0 || hours > 0 || days > 0) {
-        Serial.print(minutes);
-        Serial.print("m ");
-    }
-
-    Serial.print(seconds);
-    Serial.print(".");
-    unsigned long milliseconds = ms % 1000;
-    if (milliseconds < 100) Serial.print("0");
-    if (milliseconds < 10) Serial.print("0");
-    Serial.print(milliseconds);
-    Serial.print("s] [");
-    Serial.print(getLevelString(level));
-    Serial.print("] ");
-    Serial.println(message);
+std::string LoggerClass::liveTailJson(LogLevel level, uint32_t timestamp, const char* message) const {
+    std::string entry;
+    appendEntryJson(entry, timestamp, level, message);
+    std::string out = "{\"type\":\"log\",\"color\":\"";
+    out += getLevelColor(level);
+    out += "\",";
+    out.append(entry, 1, std::string::npos);  // entry without its opening brace
+    return out;
 }
+
+#ifdef ARDUINO
+// Serial, not ESP_LOG: with ARDUINO_USB_CDC_ON_BOOT the console UART is not the port the user watches.
+void LoggerClass::printToSerial(LogLevel level, const char* message) {
+    const uint32_t ms = getMillis();
+    Serial.printf("[%lu.%03lus] [%s] %s\n", (unsigned long)(ms / 1000), (unsigned long)(ms % 1000),
+                  getLevelString(level), message);
+}
+#else
+void LoggerClass::printToSerial(LogLevel level, const char* message) {
+    switch (level) {
+        case LOG_DEBUG:
+            ESP_LOGD(TAG, "%s", message);
+            break;
+        case LOG_INFO:
+            ESP_LOGI(TAG, "%s", message);
+            break;
+        case LOG_WARNING:
+            ESP_LOGW(TAG, "%s", message);
+            break;
+        case LOG_ERROR:
+            ESP_LOGE(TAG, "%s", message);
+            break;
+        default:
+            ESP_LOGI(TAG, "%s", message);
+            break;
+    }
+}
+#endif
 
 const char* LoggerClass::getLevelString(LogLevel level) const {
     switch (level) {
@@ -283,12 +303,20 @@ const char* LoggerClass::getLevelColor(LogLevel level) const {
     }
 }
 
-// Control bytes must be \uXXXX-escaped: one raw byte invalidates the whole /api/logs payload.
-String LoggerClass::jsonEscape(const char* text) {
+void LoggerClass::appendEntryJson(std::string& out, uint32_t timestamp, LogLevel level,
+                                  const char* message) const {
     static const char* kHex = "0123456789abcdef";
-    String out;
-    for (const char* p = text; *p; ++p) {
-        unsigned char c = (unsigned char)*p;
+
+    out += "{";
+    out += "\"timestamp\":" + std::to_string(timestamp) + ",";
+    out += "\"level\":\"";
+    out += getLevelString(level);
+    out += "\",";
+
+    // Control bytes must be \uXXXX-escaped: one raw byte invalidates the whole /api/logs payload.
+    out += "\"message\":\"";
+    for (const char* p = message; *p; ++p) {
+        const unsigned char c = static_cast<unsigned char>(*p);
         switch (c) {
             case '\\': out += "\\\\"; break;
             case '"':  out += "\\\""; break;
@@ -301,163 +329,116 @@ String LoggerClass::jsonEscape(const char* text) {
                     out += kHex[(c >> 4) & 0xF];
                     out += kHex[c & 0xF];
                 } else {
-                    out += (char)c;
+                    out += static_cast<char>(c);
                 }
         }
     }
-    return out;
-}
+    out += "\"";
 
-void LoggerClass::appendEntryJson(String& out, unsigned long timestamp, LogLevel level,
-                                  const char* message) const {
-    out += "{";
-    out += "\"timestamp\":" + String(timestamp) + ",";
-    out += "\"level\":\"" + String(getLevelString(level)) + "\",";
-    out += "\"message\":\"" + jsonEscape(message) + "\"";
     out += "}";
 }
 
-void LoggerClass::appendEntryHtml(String& out, unsigned long timestamp, LogLevel level,
+void LoggerClass::appendEntryHtml(std::string& out, uint32_t timestamp, LogLevel level,
                                   const char* message) const {
     out += "<div class='log-entry'>";
-    out += "<span class='timestamp'>" + String(timestamp) + "ms</span>";
-    out += "<span class='level' style='color:" + String(getLevelColor(level)) + "'>";
-    out += String(getLevelString(level)) + "</span>";
+    out += "<span class='timestamp'>" + std::to_string(timestamp) + "ms</span>";
+    out += "<span class='level' style='color:";
+    out += getLevelColor(level);
+    out += "'>";
+    out += getLevelString(level);
+    out += "</span>";
 
-    String escapedMsg = message;
-    escapedMsg.replace("&", "&amp;");
-    escapedMsg.replace("<", "&lt;");
-    escapedMsg.replace(">", "&gt;");
-    out += "<span class='message'>" + escapedMsg + "</span>";
-
+    out += "<span class='message'>";
+    for (const char* p = message; *p; ++p) {
+        if (*p == '&') out += "&amp;";
+        else if (*p == '<') out += "&lt;";
+        else if (*p == '>') out += "&gt;";
+        else out += *p;
+    }
+    out += "</span>";
     out += "</div>";
 }
 
-// Keeps peak allocation at a few KB however many entries are requested.
-static constexpr size_t LOG_STREAM_BATCH = 24;
+std::string LoggerClass::getLogsJSON(size_t maxEntries) const {
+    try {
+        std::string json = "[";
+        appendDroppedNotice(json, /*json=*/true);
+        bool wroteAny = json.size() > 1;
 
-// Reported as a synthetic entry, not a response field: /api/logs readers expect a bare
-// array, and the gap must survive in a downloaded copy.
-void LoggerClass::appendDroppedNotice(String& out, bool json, bool& firstOut) const {
-    uint32_t dropped = droppedCount();
-    if (dropped == 0) return;
+        {
+            MutexLock lock(_mutex);
+            if (lock.held()) {
+                size_t count = _entries.size();
+                size_t start = 0;
 
-    char notice[128];
-    snprintf(notice, sizeof(notice),
-             "[logger] %u earlier entries were dropped (out of memory, or logged before "
-             "Logger.begin())", (unsigned)dropped);
-    if (json) {
-        if (!firstOut) out += ',';
-        firstOut = false;
-        appendEntryJson(out, millis(), LOG_WARNING, notice);
-    } else {
-        appendEntryHtml(out, millis(), LOG_WARNING, notice);
+                if (maxEntries > 0 && count > maxEntries) {
+                    start = count - maxEntries;
+                }
+
+                for (size_t i = start; i < count; i++) {
+                    if (wroteAny) json += ",";
+                    wroteAny = true;
+                    const LogEntry& entry = _entries[i];
+                    appendEntryJson(json, entry.timestamp, entry.level, entry.message.c_str());
+                }
+            }
+        }
+
+        json += "]";
+        return json;
+    } catch (...) {
+        return "[]";
     }
 }
 
-bool LoggerClass::renderLogBatch(String& out, size_t& index, size_t maxEntries,
-                                 bool positioned, bool json, bool& firstOut) const {
-    if (!positioned) {
-        appendDroppedNotice(out, json, firstOut);
-    }
+std::string LoggerClass::getLogsHTML(size_t maxEntries) const {
+    try {
+        std::string entriesHtml;
+        appendDroppedNotice(entriesHtml, /*json=*/false);
+        size_t totalEntries = 0;
 
-    size_t produced = 0;
-    MutexLock lock(mutex_);
-    if (!lock.held()) return false;
-    const size_t total = entries_.size();
-    if (!positioned) {
-        index = (maxEntries > 0 && total > maxEntries) ? total - maxEntries : 0;
-    }
-    // The mutex is released between batches, so trimming can shift indices (a repeated or
-    // skipped line); holding it across a network send would stall every task that logs.
-    for (; index < total && produced < LOG_STREAM_BATCH; index++, produced++) {
-        const LogEntry& entry = entries_[index];
-        if (json) {
-            if (!firstOut) out += ',';
-            firstOut = false;
-            appendEntryJson(out, entry.timestamp, entry.level, entry.message.c_str());
-        } else {
-            appendEntryHtml(out, entry.timestamp, entry.level, entry.message.c_str());
-        }
-    }
+        {
+            MutexLock lock(_mutex);
+            if (lock.held()) {
+                totalEntries = _entries.size();
+                size_t start = 0;
+                if (maxEntries > 0 && totalEntries > maxEntries) {
+                    start = totalEntries - maxEntries;
+                }
 
-    return produced == LOG_STREAM_BATCH;
-}
-
-String LoggerClass::getLogsJSON(size_t maxEntries) const {
-    String json = "[";
-    bool wroteAny = false;
-    appendDroppedNotice(json, /*json=*/true, wroteAny);
-
-    {
-        MutexLock lock(mutex_);
-        if (lock.held()) {
-            size_t count = entries_.size();
-            size_t start = 0;
-
-            if (maxEntries > 0 && count > maxEntries) {
-                start = count - maxEntries;
-            }
-
-            for (size_t i = start; i < count; i++) {
-                if (wroteAny) json += ",";
-                wroteAny = true;
-                const LogEntry& entry = entries_[i];
-                appendEntryJson(json, entry.timestamp, entry.level, entry.message.c_str());
+                for (size_t i = start; i < totalEntries; i++) {
+                    const LogEntry& entry = _entries[i];
+                    appendEntryHtml(entriesHtml, entry.timestamp, entry.level, entry.message.c_str());
+                }
             }
         }
-    }
 
-    json += "]";
-    return json;
-}
-
-String LoggerClass::getLogsHTML(size_t maxEntries) const {
-    String logEntries;
-    bool unusedFirst = true;
-    appendDroppedNotice(logEntries, /*json=*/false, unusedFirst);
-    size_t totalEntries = 0;
-
-    {
-        MutexLock lock(mutex_);
-        if (lock.held()) {
-            totalEntries = entries_.size();
-            size_t start = 0;
-
-            if (maxEntries > 0 && totalEntries > maxEntries) {
-                start = totalEntries - maxEntries;
-            }
-
-            for (size_t i = start; i < totalEntries; i++) {
-                const LogEntry& entry = entries_[i];
-                appendEntryHtml(logEntries, entry.timestamp, entry.level, entry.message.c_str());
-            }
+        // logs_html.h is generated from logs.html by extras/convert_html.py; edit the .html.
+        const char* tpl = LOGS_HTML;
+        const char* mark = strstr(tpl, ENTRIES_MARKER);
+        if (!mark) {
+            return logsPageSlice(tpl, strlen(tpl), totalEntries, _webSocketEnabled);
         }
+        const char* after = mark + strlen(ENTRIES_MARKER);
+        std::string html = logsPageSlice(tpl, (size_t)(mark - tpl), totalEntries, _webSocketEnabled);
+        html += entriesHtml;
+        html += logsPageSlice(after, strlen(after), totalEntries, _webSocketEnabled);
+        return html;
+    } catch (...) {
+        return std::string();
     }
-
-    // logs_html.h is generated from logs.html by extras/convert_html.py; edit the .html.
-    const char* tpl = LOGS_HTML;
-    const char* mark = strstr(tpl, ENTRIES_MARKER);
-    if (!mark) {
-        return logsPageSlice(tpl, strlen(tpl), totalEntries, pageLiveTail());
-    }
-    const char* after = mark + strlen(ENTRIES_MARKER);
-    String html = logsPageSlice(tpl, (size_t)(mark - tpl), totalEntries, pageLiveTail());
-    html += logEntries;
-    html += logsPageSlice(after, strlen(after), totalEntries, pageLiveTail());
-    return html;
 }
 
 size_t LoggerClass::count() const {
-    MutexLock lock(mutex_);
-    return lock.held() ? entries_.size() : 0;
+    MutexLock lock(_mutex);
+    return lock.held() ? _entries.size() : 0;
 }
 
 void LoggerClass::clear() {
     {
-        MutexLock lock(mutex_);
+        MutexLock lock(_mutex);
         if (lock.held()) {
-            entries_.clear();
+            _entries.clear();
         }
     }
 
@@ -538,132 +519,203 @@ void LoggerClass::reportLastCrash() {
 #endif  // CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
 }
 
-// nullptr when out of memory; the handler then sends nothing and the server answers itself.
-AsyncWebServerResponse* LoggerClass::beginLogStream(AsyncWebServerRequest* request,
-                                                    size_t maxEntries, bool json) {
-    // Shared so the state outlives this call: AsyncWebServer calls the filler until it returns 0.
-    struct StreamState {
-        String pending;
-        String tail;
-        size_t index = 0;
-        bool positioned = false;
-        bool firstEntry = true;
-        bool entriesDone = false;
-        bool tailQueued = false;
-    };
+// Default window is the most recent 300, which can hide the start of a boot (where the
+// crash report prints). ?max=N widens it, ?max=0 returns everything.
+static constexpr size_t DEFAULT_WEB_LOG_ENTRIES = 300;
 
-    try {
-        auto state = std::make_shared<StreamState>();
+// Keeps peak allocation at a few KB however many entries are requested.
+static constexpr size_t LOG_STREAM_BATCH = 24;
 
-        if (json) {
-            state->pending = "[";
-            state->tail = "]";
-        } else {
-            const char* tpl = LOGS_HTML;
-            const char* mark = strstr(tpl, ENTRIES_MARKER);
-            const size_t total = this->count();
-            if (!mark) {
-                state->pending = logsPageSlice(tpl, strlen(tpl), total, pageLiveTail());
-                state->entriesDone = true;
-            } else {
-                const char* after = mark + strlen(ENTRIES_MARKER);
-                state->pending = logsPageSlice(tpl, (size_t)(mark - tpl), total, pageLiveTail());
-                state->tail = logsPageSlice(after, strlen(after), total, pageLiveTail());
+// Reported as a synthetic entry, not a response field: /api/logs readers expect a bare
+// array, and the gap must survive in a downloaded copy.
+void LoggerClass::appendDroppedNotice(std::string& out, bool json) const {
+    uint32_t dropped = droppedCount();
+    if (dropped == 0) return;
+
+    char notice[128];
+    snprintf(notice, sizeof(notice),
+             "[logger] %u earlier entries were dropped (out of memory, or logged before "
+             "Logger.begin())", (unsigned)dropped);
+    if (json) appendEntryJson(out, getMillis(), LOG_WARNING, notice);
+    else      appendEntryHtml(out, getMillis(), LOG_WARNING, notice);
+}
+
+void LoggerClass::streamLogsJson(httpd_req_t* req, size_t maxEntries) const {
+    httpd_resp_send_chunk(req, "[", 1);
+
+    std::string batch;
+    batch.reserve(4096);
+
+    size_t index = 0;
+    bool positioned = false;
+    bool first = true;
+
+    appendDroppedNotice(batch, /*json=*/true);
+    if (!batch.empty()) {
+        first = false;
+        if (httpd_resp_send_chunk(req, batch.data(), batch.size()) != ESP_OK) return;
+    }
+
+    while (true) {
+        batch.clear();
+        size_t produced = 0;
+
+        {
+            MutexLock lock(_mutex);
+            if (!lock.held()) break;
+            size_t total = _entries.size();
+            if (!positioned) {
+                index = (maxEntries > 0 && total > maxEntries) ? total - maxEntries : 0;
+                positioned = true;
+            }
+            // The mutex is released between batches, so trimming can shift indices (a repeated or
+            // skipped line); holding it across a network send would stall every task that logs.
+            for (; index < total && produced < LOG_STREAM_BATCH; index++, produced++) {
+                if (!first) batch += ',';
+                first = false;
+                const LogEntry& entry = _entries[index];
+                appendEntryJson(batch, entry.timestamp, entry.level, entry.message.c_str());
             }
         }
 
-        return request->beginChunkedResponse(json ? "application/json" : "text/html",
-            [this, state, maxEntries, json](uint8_t* buffer, size_t maxLen, size_t) -> size_t {
-                while (state->pending.length() == 0) {
-                    if (!state->entriesDone) {
-                        bool more = this->renderLogBatch(state->pending, state->index, maxEntries,
-                                                         state->positioned, json, state->firstEntry);
-                        state->positioned = true;
-                        if (!more) state->entriesDone = true;
-                        continue;
-                    }
-                    if (!state->tailQueued) {
-                        state->tailQueued = true;
-                        state->pending = state->tail;
-                        state->tail = String();
-                        continue;
-                    }
-                    return 0;
-                }
-
-                size_t take = state->pending.length() < maxLen ? state->pending.length() : maxLen;
-                memcpy(buffer, state->pending.c_str(), take);
-                state->pending.remove(0, take);
-                return take;
-            });
-    } catch (...) {
-        return nullptr;
+        if (!batch.empty() &&
+            httpd_resp_send_chunk(req, batch.data(), batch.size()) != ESP_OK) {
+            return;  // client gone; httpd has already aborted the response
+        }
+        if (produced < LOG_STREAM_BATCH) break;
     }
+
+    httpd_resp_send_chunk(req, "]", 1);
+    httpd_resp_send_chunk(req, nullptr, 0);
 }
 
-void LoggerClass::registerEndpoints(AsyncWebServer* server, AsyncWebSocket* webSocket) {
+void LoggerClass::streamLogsHtml(httpd_req_t* req, size_t maxEntries) const {
+    const char* tpl = LOGS_HTML;
+    const char* mark = strstr(tpl, ENTRIES_MARKER);
+    const size_t total = count();
+
+    std::string head = logsPageSlice(tpl, mark ? (size_t)(mark - tpl) : strlen(tpl), total,
+                                     _webSocketEnabled);
+    if (httpd_resp_send_chunk(req, head.data(), head.size()) != ESP_OK) return;
+    head.clear();
+    head.shrink_to_fit();
+
+    if (mark) {
+        std::string batch;
+        batch.reserve(4096);
+
+        size_t index = 0;
+        bool positioned = false;
+
+        appendDroppedNotice(batch, /*json=*/false);
+        if (!batch.empty() &&
+            httpd_resp_send_chunk(req, batch.data(), batch.size()) != ESP_OK) {
+            return;
+        }
+
+        while (true) {
+            batch.clear();
+            size_t produced = 0;
+
+            {
+                MutexLock lock(_mutex);
+                if (!lock.held()) break;
+                size_t entryCount = _entries.size();
+                if (!positioned) {
+                    index = (maxEntries > 0 && entryCount > maxEntries) ? entryCount - maxEntries : 0;
+                    positioned = true;
+                }
+                for (; index < entryCount && produced < LOG_STREAM_BATCH; index++, produced++) {
+                    const LogEntry& entry = _entries[index];
+                    appendEntryHtml(batch, entry.timestamp, entry.level, entry.message.c_str());
+                }
+            }
+
+            if (!batch.empty() &&
+                httpd_resp_send_chunk(req, batch.data(), batch.size()) != ESP_OK) {
+                return;
+            }
+            if (produced < LOG_STREAM_BATCH) break;
+        }
+
+        const char* after = mark + strlen(ENTRIES_MARKER);
+        std::string tail = logsPageSlice(after, strlen(after), total, _webSocketEnabled);
+        if (httpd_resp_send_chunk(req, tail.data(), tail.size()) != ESP_OK) return;
+    }
+
+    httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+static size_t logWindowFromQuery(httpd_req_t* req) {
+    size_t maxEntries = DEFAULT_WEB_LOG_ENTRIES;
+    // Sized for the whole query string: a truncated read errors and ?max= is silently ignored.
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char param[16];
+        if (httpd_query_key_value(query, "max", param, sizeof(param)) == ESP_OK) {
+            int v = atoi(param);
+            if (v > 0) maxEntries = (size_t)v;
+            else if (v == 0) maxEntries = 0;
+        }
+    }
+    return maxEntries;
+}
+
+// Out of memory mid-stream: ESP_FAIL closes the socket, so the client sees a truncated response
+// instead of a complete-looking one, and no exception reaches httpd's C code.
+esp_err_t LoggerClass::handleLogsPage(httpd_req_t* req) {
+    if (!Access.allow(req)) {
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "text/html");
+    try {
+        Logger.streamLogsHtml(req, logWindowFromQuery(req));
+    } catch (...) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t LoggerClass::handleLogsJson(httpd_req_t* req) {
+    if (!Access.allow(req)) {
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    try {
+        Logger.streamLogsJson(req, logWindowFromQuery(req));
+    } catch (...) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t LoggerClass::handleLogsClear(httpd_req_t* req) {
+    if (!wifisetup::isSameOrigin(req)) {
+        return wifisetup::sendCrossOriginRefused(req);
+    }
+    if (!Access.allow(req)) {
+        return ESP_OK;
+    }
+    Logger.clear();
+    const char* response = "{\"status\":\"success\",\"message\":\"Logs cleared\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, strlen(response));
+    return ESP_OK;
+}
+
+void LoggerClass::registerEndpoints(httpd_handle_t server) {
     if (!server) {
         return;
     }
 
-    if (webSocket) {
-        attachWebSocket(webSocket);
-    }
+    httpd_uri_t logs_page = wifisetup::route("/logs", HTTP_GET, handleLogsPage, nullptr);
+    httpd_register_uri_handler(server, &logs_page);
 
-    // Default window is the most recent 300, which can hide the start of a boot (where the
-    // crash report prints). ?max=N widens it, ?max=0 returns everything.
-    auto logWindow = [](AsyncWebServerRequest* request) -> size_t {
-        if (!request->hasParam("max")) return 300;
-        long v = request->getParam("max")->value().toInt();
-        return (v >= 0) ? (size_t)v : 300;
-    };
+    httpd_uri_t logs_json = wifisetup::route("/api/logs", HTTP_GET, handleLogsJson, nullptr);
+    httpd_register_uri_handler(server, &logs_json);
 
-    server->on("/logs", HTTP_GET, [this, logWindow](AsyncWebServerRequest* request) {
-        if (AsyncWebServerResponse* response = this->beginLogStream(request, logWindow(request), /*json=*/false)) {
-            request->send(response);
-        }
-    });
-
-    server->on("/api/logs", HTTP_GET, [this, logWindow](AsyncWebServerRequest* request) {
-        if (AsyncWebServerResponse* response = this->beginLogStream(request, logWindow(request), /*json=*/true)) {
-            request->send(response);
-        }
-    });
-
-    server->on("/api/logs/clear", HTTP_POST, [this](AsyncWebServerRequest* request) {
-        if (!wifisetup::isSameOrigin(request)) {
-            wifisetup::sendCrossOriginRefused(request);
-            return;
-        }
-        this->clear();
-        request->send(200, "application/json", "{\"status\":\"success\",\"message\":\"Logs cleared\"}");
-    });
+    httpd_uri_t logs_clear = wifisetup::route("/api/logs/clear", HTTP_POST, handleLogsClear, nullptr);
+    httpd_register_uri_handler(server, &logs_clear);
 
     info("Log endpoints registered (/logs, /api/logs)");
-}
-
-void LoggerClass::attachWebSocket(AsyncWebSocket* webSocket) {
-    webSocket_ = webSocket;
-    if (webSocket_) {
-        info("Log WebSocket attached");
-    }
-}
-
-void LoggerClass::broadcastLogEntry(unsigned long timestamp, LogLevel level,
-                                    const char* message) {
-    if (!webSocket_ || !webSocketEnabled_) {
-        return;
-    }
-
-    String json = "{";
-    json += "\"type\":\"log\",";
-    json += "\"timestamp\":" + String(timestamp) + ",";
-    json += "\"level\":\"" + String(getLevelString(level)) + "\",";
-    json += "\"color\":\"" + String(getLevelColor(level)) + "\",";
-
-    json += "\"message\":\"" + jsonEscape(message) + "\"";
-
-    json += "}";
-
-    webSocket_->textAll(json);
 }
