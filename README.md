@@ -59,7 +59,7 @@ alone is handled.
 
 ```ini
 lib_deps =
-    https://github.com/diydoohickeys/Preflight-Arduino.git#v1.1.0
+    https://github.com/diydoohickeys/Preflight-Arduino.git#v1.1.1
 ```
 
 ### Arduino IDE
@@ -217,6 +217,12 @@ sketch opts out, so add this to yours:
 ```cpp
 extern "C" bool verifyRollbackLater() { return true; }   // C linkage, or it won't override the core's
 ```
+
+`begin()` logs which image is running, e.g. `Firmware 6fdb2f100f637b45 in app0 (valid), IDF
+v5.5.5, Arduino 3.3.12`. The hash is the first 8 bytes of the image SHA-256 esptool appends to
+the `.bin` (its last 32 bytes), so it matches one specific build; the state is `untracked` after
+a USB flash, and always on a framework built without bootloader rollback. If a previous update was rolled back, a `Rolled back: the image in <slot> was
+rejected` warning follows.
 
 Pair it with the task watchdog so a hang becomes a reset. If a device still ends up on a bad
 image, flash it over USB from download mode (hold BOOT while connecting) — that path is in
